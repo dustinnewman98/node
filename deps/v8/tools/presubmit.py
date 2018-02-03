@@ -52,6 +52,7 @@ from testrunner.local import utils
 
 # Special LINT rules diverging from default and reason.
 # build/header_guard: Our guards have the form "V8_FOO_H_", not "SRC_FOO_H_".
+#   We now run our own header guard check in PRESUBMIT.py.
 # build/include_what_you_use: Started giving false positives for variables
 #   named "string" and "map" assuming that you needed to include STL headers.
 
@@ -554,9 +555,15 @@ def CheckDeps(workspace):
 
 
 def PyTests(workspace):
-  test_scripts = join(workspace, 'tools', 'release', 'test_scripts.py')
-  return subprocess.call(
-      [sys.executable, test_scripts], stdout=subprocess.PIPE) == 0
+  result = True
+  for script in [
+      join(workspace, 'tools', 'release', 'test_scripts.py'),
+      join(workspace, 'tools', 'unittests', 'run_tests_test.py'),
+    ]:
+    print 'Running ' + script
+    result &= subprocess.call(
+        [sys.executable, script], stdout=subprocess.PIPE) == 0
+  return result
 
 
 def GetOptions():
@@ -573,8 +580,8 @@ def Main():
   success = True
   print "Running checkdeps..."
   success &= CheckDeps(workspace)
-  print "Running C++ lint check..."
   if not options.no_lint:
+    print "Running C++ lint check..."
     success &= CppLintProcessor().RunOnPath(workspace)
   print "Running copyright header, trailing whitespaces and " \
         "two empty lines between declarations check..."

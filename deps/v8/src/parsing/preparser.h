@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_PARSING_PREPARSER_H
-#define V8_PARSING_PREPARSER_H
+#ifndef V8_PARSING_PREPARSER_H_
+#define V8_PARSING_PREPARSER_H_
 
 #include "src/ast/ast.h"
 #include "src/ast/scopes.h"
@@ -298,12 +298,21 @@ class PreParserExpression {
   // and PreParser.
   PreParserExpression* operator->() { return this; }
 
+  void set_is_private_field() {
+    if (variables_ != nullptr) {
+      DCHECK(IsIdentifier());
+      DCHECK_EQ(1, variables_->length());
+      variables_->first()->set_is_private_field();
+    }
+  }
+
   // More dummy implementations of things PreParser doesn't need to track:
   void SetShouldEagerCompile() {}
 
   int position() const { return kNoSourcePosition; }
   void set_function_token_position(int position) {}
   void set_scope(Scope* scope) {}
+  void set_suspend_count(int suspend_count) {}
 
  private:
   enum Type {
@@ -956,12 +965,18 @@ class PreParser : public ParserBase<PreParser> {
                bool is_inner_function, bool may_abort, bool* ok) {
     UNREACHABLE();
   }
-  Expression ParseFunctionLiteral(Identifier name,
-                                  Scanner::Location function_name_location,
-                                  FunctionNameValidity function_name_validity,
-                                  FunctionKind kind, int function_token_pos,
-                                  FunctionLiteral::FunctionType function_type,
-                                  LanguageMode language_mode, bool* ok);
+
+  Expression ParseFunctionLiteral(
+      Identifier name, Scanner::Location function_name_location,
+      FunctionNameValidity function_name_validity, FunctionKind kind,
+      int function_token_pos, FunctionLiteral::FunctionType function_type,
+      LanguageMode language_mode,
+      ZoneList<const AstRawString*>* arguments_for_wrapped_function, bool* ok);
+
+  PreParserExpression InitializeObjectLiteral(PreParserExpression literal) {
+    return literal;
+  }
+
   LazyParsingResult ParseStatementListAndLogFunction(
       PreParserFormalParameters* formals, bool maybe_abort, bool* ok);
 
@@ -999,7 +1014,6 @@ class PreParser : public ParserBase<PreParser> {
   V8_INLINE void RewriteAsyncFunctionBody(
       PreParserStatementList body, PreParserStatement block,
       const PreParserExpression& return_value, bool* ok) {}
-  V8_INLINE void RewriteNonPattern(bool* ok) { ValidateExpression(ok); }
 
   void DeclareAndInitializeVariables(
       PreParserStatement block,
@@ -1141,7 +1155,9 @@ class PreParser : public ParserBase<PreParser> {
                                       bool is_static, bool is_constructor,
                                       bool is_computed_name,
                                       ClassInfo* class_info, bool* ok) {
-    if (kind == ClassLiteralProperty::FIELD && is_computed_name) {
+    // TODO(gsathya): Fix preparsed scope data for PRIVATE_FIELDs by
+    // allocating context variable here.
+    if (kind == ClassLiteralProperty::PUBLIC_FIELD && is_computed_name) {
       scope()->DeclareVariableName(
           ClassFieldVariableName(ast_value_factory(),
                                  class_info->computed_field_count),
@@ -1186,8 +1202,6 @@ class PreParser : public ParserBase<PreParser> {
 
   V8_INLINE void QueueDestructuringAssignmentForRewriting(
       PreParserExpression assignment) {}
-  V8_INLINE void QueueNonPatternForRewriting(const PreParserExpression& expr,
-                                             bool* ok) {}
 
   // Helper functions for recursive descent.
   V8_INLINE bool IsEval(const PreParserIdentifier& identifier) const {
@@ -1665,10 +1679,6 @@ class PreParser : public ParserBase<PreParser> {
     return function_state_->GetReportedErrorList();
   }
 
-  V8_INLINE ZoneList<PreParserExpression>* GetNonPatternList() const {
-    return function_state_->non_patterns_to_rewrite();
-  }
-
   V8_INLINE void CountUsage(v8::Isolate::UseCounterFeature feature) {
     if (use_counts_ != nullptr) ++use_counts_[feature];
   }
@@ -1708,4 +1718,4 @@ PreParserExpression PreParser::SpreadCallNew(
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_PARSING_PREPARSER_H
+#endif  // V8_PARSING_PREPARSER_H_

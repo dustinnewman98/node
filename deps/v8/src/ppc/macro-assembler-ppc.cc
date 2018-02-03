@@ -15,6 +15,7 @@
 #include "src/debug/debug.h"
 #include "src/external-reference-table.h"
 #include "src/frames-inl.h"
+#include "src/instruction-stream.h"
 #include "src/register-configuration.h"
 #include "src/runtime/runtime.h"
 
@@ -445,7 +446,7 @@ void MacroAssembler::RecordWrite(Register object, Register address,
   if (emit_debug_code()) {
     LoadP(r0, MemOperand(address));
     cmp(r0, value);
-    Check(eq, kWrongAddressOrValuePassedToRecordWrite);
+    Check(eq, AbortReason::kWrongAddressOrValuePassedToRecordWrite);
   }
 
   if (remembered_set_action == OMIT_REMEMBERED_SET &&
@@ -694,7 +695,7 @@ void TurboAssembler::ShiftLeftPair(Register dst_low, Register dst_high,
   cmpi(shift, Operand(32));
   blt(&less_than_32);
   // If shift >= 32
-  andi(scratch, shift, Operand(0x1f));
+  andi(scratch, shift, Operand(0x1F));
   slw(dst_high, src_low, scratch);
   li(dst_low, Operand::Zero());
   b(&done);
@@ -717,7 +718,7 @@ void TurboAssembler::ShiftLeftPair(Register dst_low, Register dst_high,
     Move(dst_high, src_low);
     li(dst_low, Operand::Zero());
   } else if (shift > 32) {
-    shift &= 0x1f;
+    shift &= 0x1F;
     slwi(dst_high, src_low, Operand(shift));
     li(dst_low, Operand::Zero());
   } else if (shift == 0) {
@@ -741,7 +742,7 @@ void TurboAssembler::ShiftRightPair(Register dst_low, Register dst_high,
   cmpi(shift, Operand(32));
   blt(&less_than_32);
   // If shift >= 32
-  andi(scratch, shift, Operand(0x1f));
+  andi(scratch, shift, Operand(0x1F));
   srw(dst_low, src_high, scratch);
   li(dst_high, Operand::Zero());
   b(&done);
@@ -764,7 +765,7 @@ void TurboAssembler::ShiftRightPair(Register dst_low, Register dst_high,
     Move(dst_low, src_high);
     li(dst_high, Operand::Zero());
   } else if (shift > 32) {
-    shift &= 0x1f;
+    shift &= 0x1F;
     srwi(dst_low, src_high, Operand(shift));
     li(dst_high, Operand::Zero());
   } else if (shift == 0) {
@@ -787,7 +788,7 @@ void TurboAssembler::ShiftRightAlgPair(Register dst_low, Register dst_high,
   cmpi(shift, Operand(32));
   blt(&less_than_32);
   // If shift >= 32
-  andi(scratch, shift, Operand(0x1f));
+  andi(scratch, shift, Operand(0x1F));
   sraw(dst_low, src_high, scratch);
   srawi(dst_high, src_high, 31);
   b(&done);
@@ -810,7 +811,7 @@ void TurboAssembler::ShiftRightAlgPair(Register dst_low, Register dst_high,
     Move(dst_low, src_high);
     srawi(dst_high, src_high, 31);
   } else if (shift > 32) {
-    shift &= 0x1f;
+    shift &= 0x1F;
     srawi(dst_low, src_high, shift);
     srawi(dst_high, src_high, 31);
   } else if (shift == 0) {
@@ -1034,6 +1035,7 @@ void MacroAssembler::LeaveExitFrame(bool save_doubles, Register argument_count,
   LoadP(cp, MemOperand(ip));
 
 #ifdef DEBUG
+  mov(r6, Operand(Context::kInvalidContext));
   mov(ip,
       Operand(ExternalReference(IsolateAddressId::kContextAddress, isolate())));
   StoreP(r6, MemOperand(ip));
@@ -1091,7 +1093,7 @@ void TurboAssembler::PrepareForTailCall(const ParameterCount& callee_args_count,
 
   if (FLAG_debug_code) {
     cmpl(src_reg, dst_reg);
-    Check(lt, kStackAccessBelowStackPointer);
+    Check(lt, AbortReason::kStackAccessBelowStackPointer);
   }
 
   // Restore caller's frame pointer and return address now as they will be
@@ -1306,14 +1308,6 @@ void MacroAssembler::InvokeFunction(Register function,
   InvokeFunctionCode(r4, no_reg, expected, actual, flag);
 }
 
-void MacroAssembler::InvokeFunction(Handle<JSFunction> function,
-                                    const ParameterCount& expected,
-                                    const ParameterCount& actual,
-                                    InvokeFlag flag) {
-  Move(r4, function);
-  InvokeFunction(r4, expected, actual, flag);
-}
-
 void MacroAssembler::MaybeDropFrames() {
   // Check whether we need to drop frames to restart a function on the stack.
   ExternalReference restart_fp =
@@ -1327,8 +1321,10 @@ void MacroAssembler::MaybeDropFrames() {
 
 void MacroAssembler::PushStackHandler() {
   // Adjust this code if not the case.
-  STATIC_ASSERT(StackHandlerConstants::kSize == 1 * kPointerSize);
+  STATIC_ASSERT(StackHandlerConstants::kSize == 2 * kPointerSize);
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0 * kPointerSize);
+
+  Push(Smi::kZero);  // Padding.
 
   // Link the current handler as the next handler.
   // Preserve r3-r7.
@@ -1343,13 +1339,15 @@ void MacroAssembler::PushStackHandler() {
 
 
 void MacroAssembler::PopStackHandler() {
-  STATIC_ASSERT(StackHandlerConstants::kSize == 1 * kPointerSize);
+  STATIC_ASSERT(StackHandlerConstants::kSize == 2 * kPointerSize);
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0);
 
   pop(r4);
   mov(ip,
       Operand(ExternalReference(IsolateAddressId::kHandlerAddress, isolate())));
   StoreP(r4, MemOperand(ip));
+
+  Drop(1);  // Drop padding.
 }
 
 
@@ -1365,7 +1363,7 @@ void MacroAssembler::CompareObjectType(Register object, Register map,
 void MacroAssembler::CompareInstanceType(Register map, Register type_reg,
                                          InstanceType type) {
   STATIC_ASSERT(Map::kInstanceTypeOffset < 4096);
-  STATIC_ASSERT(LAST_TYPE <= 0xffff);
+  STATIC_ASSERT(LAST_TYPE <= 0xFFFF);
   lhz(type_reg, FieldMemOperand(map, Map::kInstanceTypeOffset));
   cmpi(type_reg, Operand(type));
 }
@@ -1621,6 +1619,11 @@ void MacroAssembler::JumpToExternalReference(const ExternalReference& builtin,
   Jump(stub.GetCode(), RelocInfo::CODE_TARGET);
 }
 
+void MacroAssembler::JumpToInstructionStream(const InstructionStream* stream) {
+  intptr_t bytes_address = reinterpret_cast<intptr_t>(stream->bytes());
+  mov(kOffHeapTrampolineRegister, Operand(bytes_address, RelocInfo::NONE));
+  Jump(kOffHeapTrampolineRegister);
+}
 
 void MacroAssembler::IncrementCounter(StatsCounter* counter, int value,
                                       Register scratch1, Register scratch2) {
@@ -1645,12 +1648,12 @@ void MacroAssembler::DecrementCounter(StatsCounter* counter, int value,
   }
 }
 
-void TurboAssembler::Assert(Condition cond, BailoutReason reason,
+void TurboAssembler::Assert(Condition cond, AbortReason reason,
                             CRegister cr) {
   if (emit_debug_code()) Check(cond, reason, cr);
 }
 
-void TurboAssembler::Check(Condition cond, BailoutReason reason, CRegister cr) {
+void TurboAssembler::Check(Condition cond, AbortReason reason, CRegister cr) {
   Label L;
   b(cond, &L, cr);
   Abort(reason);
@@ -1658,7 +1661,7 @@ void TurboAssembler::Check(Condition cond, BailoutReason reason, CRegister cr) {
   bind(&L);
 }
 
-void TurboAssembler::Abort(BailoutReason reason) {
+void TurboAssembler::Abort(AbortReason reason) {
   Label abort_start;
   bind(&abort_start);
 #ifdef DEBUG
@@ -1713,7 +1716,7 @@ void MacroAssembler::AssertNotSmi(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     TestIfSmi(object, r0);
-    Check(ne, kOperandIsASmi, cr0);
+    Check(ne, AbortReason::kOperandIsASmi, cr0);
   }
 }
 
@@ -1722,7 +1725,7 @@ void MacroAssembler::AssertSmi(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     TestIfSmi(object, r0);
-    Check(eq, kOperandIsNotSmi, cr0);
+    Check(eq, AbortReason::kOperandIsNotASmi, cr0);
   }
 }
 
@@ -1730,11 +1733,11 @@ void MacroAssembler::AssertFixedArray(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     TestIfSmi(object, r0);
-    Check(ne, kOperandIsASmiAndNotAFixedArray, cr0);
+    Check(ne, AbortReason::kOperandIsASmiAndNotAFixedArray, cr0);
     push(object);
     CompareObjectType(object, object, object, FIXED_ARRAY_TYPE);
     pop(object);
-    Check(eq, kOperandIsNotAFixedArray);
+    Check(eq, AbortReason::kOperandIsNotAFixedArray);
   }
 }
 
@@ -1742,11 +1745,11 @@ void MacroAssembler::AssertFunction(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     TestIfSmi(object, r0);
-    Check(ne, kOperandIsASmiAndNotAFunction, cr0);
+    Check(ne, AbortReason::kOperandIsASmiAndNotAFunction, cr0);
     push(object);
     CompareObjectType(object, object, object, JS_FUNCTION_TYPE);
     pop(object);
-    Check(eq, kOperandIsNotAFunction);
+    Check(eq, AbortReason::kOperandIsNotAFunction);
   }
 }
 
@@ -1755,18 +1758,18 @@ void MacroAssembler::AssertBoundFunction(Register object) {
   if (emit_debug_code()) {
     STATIC_ASSERT(kSmiTag == 0);
     TestIfSmi(object, r0);
-    Check(ne, kOperandIsASmiAndNotABoundFunction, cr0);
+    Check(ne, AbortReason::kOperandIsASmiAndNotABoundFunction, cr0);
     push(object);
     CompareObjectType(object, object, object, JS_BOUND_FUNCTION_TYPE);
     pop(object);
-    Check(eq, kOperandIsNotABoundFunction);
+    Check(eq, AbortReason::kOperandIsNotABoundFunction);
   }
 }
 
 void MacroAssembler::AssertGeneratorObject(Register object) {
   if (!emit_debug_code()) return;
   TestIfSmi(object, r0);
-  Check(ne, kOperandIsASmiAndNotAGeneratorObject, cr0);
+  Check(ne, AbortReason::kOperandIsASmiAndNotAGeneratorObject, cr0);
 
   // Load map
   Register map = object;
@@ -1785,7 +1788,7 @@ void MacroAssembler::AssertGeneratorObject(Register object) {
   bind(&do_check);
   // Restore generator object to register and perform assertion
   pop(object);
-  Check(eq, kOperandIsNotAGeneratorObject);
+  Check(eq, AbortReason::kOperandIsNotAGeneratorObject);
 }
 
 void MacroAssembler::AssertUndefinedOrAllocationSite(Register object,
@@ -1797,7 +1800,7 @@ void MacroAssembler::AssertUndefinedOrAllocationSite(Register object,
     beq(&done_checking);
     LoadP(scratch, FieldMemOperand(object, HeapObject::kMapOffset));
     CompareRoot(scratch, Heap::kAllocationSiteMapRootIndex);
-    Assert(eq, kExpectedUndefinedOrCell);
+    Assert(eq, AbortReason::kExpectedUndefinedOrCell);
     bind(&done_checking);
   }
 }

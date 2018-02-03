@@ -6,6 +6,7 @@
 
 #include <memory>
 
+#include "src/api.h"
 #include "src/arguments.h"
 #include "src/ast/prettyprinter.h"
 #include "src/bootstrapper.h"
@@ -525,10 +526,6 @@ RUNTIME_FUNCTION(Runtime_DeserializeLazy) {
   DCHECK(Builtins::IsLazy(builtin_id));
   DCHECK_EQ(Builtins::TFJ, Builtins::KindOf(builtin_id));
 
-  if (FLAG_trace_lazy_deserialization) {
-    PrintF("Lazy-deserializing builtin %s\n", Builtins::name(builtin_id));
-  }
-
   Code* code = Snapshot::DeserializeBuiltin(isolate, builtin_id);
   DCHECK_EQ(builtin_id, code->builtin_index());
   DCHECK_EQ(code, isolate->builtins()->builtin(builtin_id));
@@ -637,8 +634,13 @@ RUNTIME_FUNCTION(Runtime_CreateAsyncFromSyncIterator) {
         isolate, NewTypeError(MessageTemplate::kSymbolIteratorInvalid));
   }
 
+  Handle<Object> next;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, next,
+      Object::GetProperty(sync_iterator, isolate->factory()->next_string()));
+
   return *isolate->factory()->NewJSAsyncFromSyncIterator(
-      Handle<JSReceiver>::cast(sync_iterator));
+      Handle<JSReceiver>::cast(sync_iterator), next);
 }
 
 RUNTIME_FUNCTION(Runtime_GetTemplateObject) {
@@ -648,6 +650,23 @@ RUNTIME_FUNCTION(Runtime_GetTemplateObject) {
 
   return *TemplateObjectDescription::GetTemplateObject(
       description, isolate->native_context());
+}
+
+RUNTIME_FUNCTION(Runtime_ReportMessage) {
+  // Helper to report messages and continue JS execution. This is intended to
+  // behave similarly to reporting exceptions which reach the top-level in
+  // Execution.cc, but allow the JS code to continue. This is useful for
+  // implementing algorithms such as RunMicrotasks in JS.
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(Object, message_obj, 0);
+
+  DCHECK(!isolate->has_pending_exception());
+  isolate->set_pending_exception(*message_obj);
+  isolate->ReportPendingMessagesFromJavaScript();
+  isolate->clear_pending_exception();
+  return isolate->heap()->undefined_value();
 }
 
 }  // namespace internal

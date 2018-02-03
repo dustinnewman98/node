@@ -97,6 +97,22 @@ Node* ObjectBuiltinsAssembler::ConstructDataDescriptor(Node* context,
   return js_desc;
 }
 
+TF_BUILTIN(ObjectPrototypeToLocaleString, CodeStubAssembler) {
+  TNode<Context> context = CAST(Parameter(Descriptor::kContext));
+  TNode<Object> receiver = CAST(Parameter(Descriptor::kReceiver));
+
+  Label if_null_or_undefined(this, Label::kDeferred);
+  GotoIf(IsNullOrUndefined(receiver), &if_null_or_undefined);
+
+  TNode<Object> method =
+      CAST(GetProperty(context, receiver, factory()->toString_string()));
+  Return(CallJS(CodeFactory::Call(isolate()), context, method, receiver));
+
+  BIND(&if_null_or_undefined);
+  ThrowTypeError(context, MessageTemplate::kCalledOnNullOrUndefined,
+                 "Object.prototype.toLocaleString");
+}
+
 TF_BUILTIN(ObjectPrototypeHasOwnProperty, ObjectBuiltinsAssembler) {
   Node* object = Parameter(Descriptor::kReceiver);
   Node* key = Parameter(Descriptor::kKey);
@@ -550,7 +566,7 @@ TF_BUILTIN(ObjectPrototypeToString, ObjectBuiltinsAssembler) {
       GotoIf(IsNull(holder), &return_default);
       Node* holder_map = LoadMap(holder);
       Node* holder_bit_field3 = LoadMapBitField3(holder_map);
-      GotoIf(IsSetWord32<Map::MayHaveInterestingSymbols>(holder_bit_field3),
+      GotoIf(IsSetWord32<Map::MayHaveInterestingSymbolsBit>(holder_bit_field3),
              &return_generic);
       var_holder.Bind(LoadMapPrototype(holder_map));
       Goto(&loop);
@@ -615,7 +631,7 @@ TF_BUILTIN(ObjectCreate, ObjectBuiltinsAssembler) {
               &call_runtime);
     // Handle dictionary objects or fast objects with properties in runtime.
     Node* bit_field3 = LoadMapBitField3(properties_map);
-    GotoIf(IsSetWord32<Map::DictionaryMap>(bit_field3), &call_runtime);
+    GotoIf(IsSetWord32<Map::IsDictionaryMapBit>(bit_field3), &call_runtime);
     Branch(IsSetWord32<Map::NumberOfOwnDescriptorsBits>(bit_field3),
            &call_runtime, &no_properties);
   }
@@ -744,7 +760,7 @@ TF_BUILTIN(CreateGeneratorObject, ObjectBuiltinsAssembler) {
 
   // Get the initial map from the function, jumping to the runtime if we don't
   // have one.
-  Label runtime(this);
+  Label done(this), runtime(this);
   GotoIfNot(IsFunctionWithPrototypeSlotMap(LoadMap(closure)), &runtime);
   Node* maybe_map =
       LoadObjectField(closure, JSFunction::kPrototypeOrInitialMapOffset);
@@ -774,7 +790,13 @@ TF_BUILTIN(CreateGeneratorObject, ObjectBuiltinsAssembler) {
   Node* executing = SmiConstant(JSGeneratorObject::kGeneratorExecuting);
   StoreObjectFieldNoWriteBarrier(result, JSGeneratorObject::kContinuationOffset,
                                  executing);
-  Return(result);
+  GotoIfNot(HasInstanceType(maybe_map, JS_ASYNC_GENERATOR_OBJECT_TYPE), &done);
+  StoreObjectFieldNoWriteBarrier(
+      result, JSAsyncGeneratorObject::kIsAwaitingOffset, SmiConstant(0));
+  Goto(&done);
+
+  BIND(&done);
+  { Return(result); }
 
   BIND(&runtime);
   {

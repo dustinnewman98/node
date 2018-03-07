@@ -172,13 +172,13 @@ coverage-build: all
 		$(NODE) ./deps/npm install istanbul-merge --no-save --no-package-lock; fi
 	if [ ! -d node_modules/nyc ]; then \
 		$(NODE) ./deps/npm install nyc --no-save --no-package-lock; fi
-	if [ ! -d gcovr ]; then git clone --depth=1 \
+	if [ ! -d gcovr ]; then git clone -b 3.4 --depth=1 \
 		--single-branch git://github.com/gcovr/gcovr.git; fi
 	if [ ! -d build ]; then git clone --depth=1 \
 		--single-branch https://github.com/nodejs/build.git; fi
 	if [ ! -f gcovr/scripts/gcovr.orig ]; then \
 		(cd gcovr && patch -N -p1 < \
-		"$(CURDIR)/build/jenkins/scripts/coverage/gcovr-patches.diff"); fi
+		"$(CURDIR)/build/jenkins/scripts/coverage/gcovr-patches-3.4.diff"); fi
 	if [ -d lib_ ]; then $(RM) -r lib; mv lib_ lib; fi
 	mv lib lib_
 	$(NODE) ./node_modules/.bin/nyc instrument --extension .js --extension .mjs lib_/ lib/
@@ -619,7 +619,7 @@ doc-only: $(apidoc_dirs) $(apiassets)  ## Builds the docs with the local or the 
 	if [ ! -d doc/api/assets ]; then \
 		$(MAKE) tools/doc/node_modules/js-yaml/package.json; \
 	fi;
-	@$(MAKE) -s $(apidocs_html) $(apidocs_json)
+	@$(MAKE) $(apidocs_html) $(apidocs_json)
 
 .PHONY: doc
 doc: $(NODE_EXE) doc-only
@@ -1056,15 +1056,18 @@ lint-md-clean:
 	$(RM) -r tools/remark-preset-lint-node/node_modules
 	$(RM) tools/.*mdlintstamp
 
-.PHONY: lint-md-build
-lint-md-build:
-	@if [ ! -d tools/remark-cli/node_modules ]; then \
-		echo "Markdown linter: installing remark-cli into tools/"; \
-		cd tools/remark-cli && $(call available-node,$(run-npm-install)) fi
-	@if [ ! -d tools/remark-preset-lint-node/node_modules ]; then \
-		echo "Markdown linter: installing remark-preset-lint-node into tools/"; \
-		cd tools/remark-preset-lint-node && $(call available-node,$(run-npm-install)) fi
+tools/remark-cli/node_modules: tools/remark-cli/package.json
+	@echo "Markdown linter: installing remark-cli into tools/"
+	@cd tools/remark-cli && $(call available-node,$(run-npm-install))
 
+tools/remark-preset-lint-node/node_modules: \
+	tools/remark-preset-lint-node/package.json
+	@echo "Markdown linter: installing remark-preset-lint-node into tools/"
+	@cd tools/remark-preset-lint-node && $(call available-node,$(run-npm-install))
+
+.PHONY: lint-md-build
+lint-md-build: tools/remark-cli/node_modules \
+	tools/remark-preset-lint-node/node_modules
 
 .PHONY: lint-md
 ifneq ("","$(wildcard tools/remark-cli/node_modules/)")
@@ -1098,10 +1101,10 @@ lint-md:
 	@echo "To install (requires internet access) run: $ make lint-md-build"
 endif
 
-LINT_JS_TARGETS = benchmark doc lib test tools
+LINT_JS_TARGETS = .eslintrc.js benchmark doc lib test tools
 
 run-lint-js = tools/node_modules/eslint/bin/eslint.js --cache \
-	--rulesdir=tools/eslint-rules --ext=.js,.mjs,.md $(LINT_JS_TARGETS)
+	--ext=.js,.mjs,.md $(LINT_JS_TARGETS) --ignore-pattern '!.eslintrc.js'
 run-lint-js-fix = $(run-lint-js) --fix
 
 .PHONY: lint-js-fix
@@ -1186,6 +1189,7 @@ lint: ## Run JS, C++, MD and doc linters.
 	$(MAKE) lint-js || EXIT_STATUS=$$? ; \
 	$(MAKE) lint-cpp || EXIT_STATUS=$$? ; \
 	$(MAKE) lint-addon-docs || EXIT_STATUS=$$? ; \
+	$(MAKE) lint-md || EXIT_STATUS=$$? ; \
 	exit $$EXIT_STATUS
 CONFLICT_RE=^>>>>>>> [0-9A-Fa-f]+|^<<<<<<< [A-Za-z]+
 

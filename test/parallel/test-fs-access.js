@@ -80,7 +80,8 @@ fs.access(readOnlyFile, fs.F_OK | fs.R_OK, common.mustCall((err) => {
   assert.ifError(err);
 }));
 
-fs.access(readOnlyFile, fs.W_OK, common.mustCall((err) => {
+fs.access(readOnlyFile, fs.W_OK, common.mustCall(function(err) {
+  assert.strictEqual(this, undefined);
   if (hasWriteAccessForReadonlyFile) {
     assert.ifError(err);
   } else {
@@ -118,15 +119,10 @@ common.expectsError(
     type: TypeError
   });
 
-assert.doesNotThrow(() => {
-  fs.accessSync(__filename);
-});
-
-assert.doesNotThrow(() => {
-  const mode = fs.F_OK | fs.R_OK | fs.W_OK;
-
-  fs.accessSync(readWriteFile, mode);
-});
+// Regular access should not throw.
+fs.accessSync(__filename);
+const mode = fs.F_OK | fs.R_OK | fs.W_OK;
+fs.accessSync(readWriteFile, mode);
 
 assert.throws(
   () => { fs.accessSync(doesNotExist); },

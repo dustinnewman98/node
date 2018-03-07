@@ -34,8 +34,9 @@ involving knowledge of several components and APIs :
 
  - Node.js includes a number of other statically linked libraries including
    OpenSSL. These other libraries are located in the `deps/` directory in the
-   Node.js source tree. Only the V8 and OpenSSL symbols are purposefully
-   re-exported by Node.js and may be used to various extents by Addons.
+   Node.js source tree. Only the libuv, OpenSSL, V8 and zlib symbols are
+   purposefully re-exported by Node.js and may be used to various extents by
+   Addons.
    See [Linking to Node.js' own dependencies][] for additional information.
 
 All of the following examples are available for [download][] and may
@@ -115,7 +116,7 @@ specifically to compile Node.js Addons.
 }
 ```
 
-*Note*: A version of the `node-gyp` utility is bundled and distributed with
+A version of the `node-gyp` utility is bundled and distributed with
 Node.js as part of `npm`. This version is not made directly available for
 developers to use and is intended only to support the ability to use the
 `npm install` command to compile and install Addons. Developers who wish to
@@ -292,7 +293,7 @@ Each of these examples using the following `binding.gyp` file:
 ```
 
 In cases where there is more than one `.cc` file, simply add the additional
-filename to the `sources` array. For example:
+filename to the `sources` array:
 
 ```json
 "sources": ["addon.cc", "myexample.cc"]

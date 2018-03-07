@@ -102,6 +102,7 @@ using v8::ObjectTemplate;
 using v8::Promise;
 using v8::String;
 using v8::Symbol;
+using v8::Uint32;
 using v8::Undefined;
 using v8::Value;
 
@@ -109,7 +110,7 @@ using v8::Value;
 # define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
 
-#define GET_OFFSET(a) ((a)->IsNumber() ? (a)->IntegerValue() : -1)
+#define GET_OFFSET(a) ((a)->IsNumber() ? (a).As<Integer>()->Value() : -1)
 
 // The FileHandle object wraps a file descriptor and will close it on garbage
 // collection if necessary. If that happens, a process warning will be
@@ -132,7 +133,6 @@ FileHandle::~FileHandle() {
   CHECK(!closing_);  // We should not be deleting while explicitly closing!
   Close();           // Close synchronously and emit warning
   CHECK(closed_);    // We have to be closed at the point
-  CHECK(persistent().IsEmpty());
 }
 
 
@@ -283,7 +283,8 @@ void FSReqWrap::SetReturnValue(const FunctionCallbackInfo<Value>& args) {
 void FSReqPromise::SetReturnValue(const FunctionCallbackInfo<Value>& args) {
   Local<Context> context = env()->context();
   args.GetReturnValue().Set(
-    object()->Get(context, env()->promise_string()).ToLocalChecked());
+    object()->Get(context, env()->promise_string()).ToLocalChecked()
+      .As<Promise::Resolver>()->GetPromise());
 }
 
 void NewFSReqWrap(const FunctionCallbackInfo<Value>& args) {
@@ -300,7 +301,7 @@ FSReqPromise::FSReqPromise(Environment* env)
       stats_field_array_(env->isolate(), 14) {
   auto resolver = Promise::Resolver::New(env->context()).ToLocalChecked();
   object()->Set(env->context(), env->promise_string(),
-                resolver.As<Promise>()).FromJust();
+                resolver).FromJust();
 }
 
 FSReqPromise::~FSReqPromise() {
@@ -315,9 +316,7 @@ void FSReqPromise::Reject(Local<Value> reject) {
   Local<Value> value =
       object()->Get(env()->context(),
                     env()->promise_string()).ToLocalChecked();
-  CHECK(value->IsPromise());
-  Local<Promise> promise = value.As<Promise>();
-  Local<Promise::Resolver> resolver = promise.As<Promise::Resolver>();
+  Local<Promise::Resolver> resolver = value.As<Promise::Resolver>();
   resolver->Reject(env()->context(), reject).FromJust();
 }
 
@@ -336,7 +335,6 @@ void FSReqPromise::Resolve(Local<Value> value) {
   Local<Value> val =
       object()->Get(env()->context(),
                     env()->promise_string()).ToLocalChecked();
-  CHECK(val->IsPromise());
   Local<Promise::Resolver> resolver = val.As<Promise::Resolver>();
   resolver->Resolve(env()->context(), value).FromJust();
 }
@@ -518,6 +516,7 @@ class fs_req_wrap {
   DISALLOW_COPY_AND_ASSIGN(fs_req_wrap);
 };
 
+// Returns nullptr if the operation fails from the start.
 template <typename Func, typename... Args>
 inline FSReqBase* AsyncDestCall(Environment* env,
     FSReqBase* req_wrap,
@@ -532,16 +531,16 @@ inline FSReqBase* AsyncDestCall(Environment* env,
     uv_fs_t* uv_req = req_wrap->req();
     uv_req->result = err;
     uv_req->path = nullptr;
-    after(uv_req);
+    after(uv_req);  // after may delete req_wrap if there is an error
     req_wrap = nullptr;
+  } else {
+    req_wrap->SetReturnValue(args);
   }
 
-  if (req_wrap != nullptr) {
-    args.GetReturnValue().Set(req_wrap->persistent());
-  }
   return req_wrap;
 }
 
+// Returns nullptr if the operation fails from the start.
 template <typename Func, typename... Args>
 inline FSReqBase* AsyncCall(Environment* env,
     FSReqBase* req_wrap,
@@ -576,24 +575,6 @@ inline int SyncCall(Environment* env, Local<Value> ctx, fs_req_wrap* req_wrap,
   return err;
 }
 
-#define SYNC_DEST_CALL(func, path, dest, ...)                                 \
-  fs_req_wrap sync_wrap;                                                      \
-  env->PrintSyncTrace();                                                      \
-  int err = uv_fs_ ## func(env->event_loop(),                                 \
-                         &sync_wrap.req,                                      \
-                         __VA_ARGS__,                                         \
-                         nullptr);                                            \
-  if (err < 0) {                                                              \
-    return env->ThrowUVException(err, #func, nullptr, path, dest);            \
-  }                                                                           \
-
-#define SYNC_CALL(func, path, ...)                                            \
-  SYNC_DEST_CALL(func, path, nullptr, __VA_ARGS__)                            \
-
-#define SYNC_REQ sync_wrap.req
-
-#define SYNC_RESULT err
-
 inline FSReqBase* GetReqWrap(Environment* env, Local<Value> value) {
   if (value->IsObject()) {
     return Unwrap<FSReqBase>(value.As<Object>());
@@ -620,7 +601,6 @@ void Access(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {  // access(path, mode, req)
     AsyncCall(env, req_wrap, args, "access", UTF8, AfterNoArgs,
               uv_fs_access, *path, mode);
-    req_wrap->SetReturnValue(args);
   } else {  // access(path, mode, undefined, ctx)
     CHECK_EQ(argc, 4);
     fs_req_wrap req_wrap;
@@ -642,7 +622,6 @@ void Close(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {  // close(fd, req)
     AsyncCall(env, req_wrap, args, "close", UTF8, AfterNoArgs,
               uv_fs_close, fd);
-    req_wrap->SetReturnValue(args);
   } else {  // close(fd, undefined, ctx)
     CHECK_EQ(argc, 3);
     fs_req_wrap req_wrap;
@@ -652,9 +631,8 @@ void Close(const FunctionCallbackInfo<Value>& args) {
 
 
 // Used to speed up module loading.  Returns the contents of the file as
-// a string or undefined when the file cannot be opened.  Returns an empty
-// string when the file does not contain the substring '"main"' because that
-// is the property we care about.
+// a string or undefined when the file cannot be opened or "main" is not found
+// in the file.
 static void InternalModuleReadJSON(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   uv_loop_t* loop = env->event_loop();
@@ -673,6 +651,12 @@ static void InternalModuleReadJSON(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
+  std::shared_ptr<void> defer_close(nullptr, [fd, loop] (...) {
+    uv_fs_t close_req;
+    CHECK_EQ(0, uv_fs_close(loop, &close_req, fd, nullptr));
+    uv_fs_req_cleanup(&close_req);
+  });
+
   const size_t kBlockSize = 32 << 10;
   std::vector<char> chars;
   int64_t offset = 0;
@@ -689,13 +673,11 @@ static void InternalModuleReadJSON(const FunctionCallbackInfo<Value>& args) {
     numchars = uv_fs_read(loop, &read_req, fd, &buf, 1, offset, nullptr);
     uv_fs_req_cleanup(&read_req);
 
-    CHECK_GE(numchars, 0);
+    if (numchars < 0)
+      return;
+
     offset += numchars;
   } while (static_cast<size_t>(numchars) == kBlockSize);
-
-  uv_fs_t close_req;
-  CHECK_EQ(0, uv_fs_close(loop, &close_req, fd, nullptr));
-  uv_fs_req_cleanup(&close_req);
 
   size_t start = 0;
   if (offset >= 3 && 0 == memcmp(&chars[0], "\xEF\xBB\xBF", 3)) {
@@ -704,7 +686,7 @@ static void InternalModuleReadJSON(const FunctionCallbackInfo<Value>& args) {
 
   const size_t size = offset - start;
   if (size == 0 || size == SearchString(&chars[start], size, "\"main\"")) {
-    args.GetReturnValue().SetEmptyString();
+    return;
   } else {
     Local<String> chars_string =
         String::NewFromUtf8(env->isolate(),
@@ -748,7 +730,6 @@ static void Stat(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {  // stat(path, req)
     AsyncCall(env, req_wrap, args, "stat", UTF8, AfterStat,
               uv_fs_stat, *path);
-    req_wrap->SetReturnValue(args);
   } else {  // stat(path, undefined, ctx)
     CHECK_EQ(argc, 3);
     fs_req_wrap req_wrap;
@@ -773,7 +754,6 @@ static void LStat(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {  // lstat(path, req)
     AsyncCall(env, req_wrap, args, "lstat", UTF8, AfterStat,
               uv_fs_lstat, *path);
-    req_wrap->SetReturnValue(args);
   } else {  // lstat(path, undefined, ctx)
     CHECK_EQ(argc, 3);
     fs_req_wrap req_wrap;
@@ -798,7 +778,6 @@ static void FStat(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {  // fstat(fd, req)
     AsyncCall(env, req_wrap, args, "fstat", UTF8, AfterStat,
               uv_fs_fstat, fd);
-    req_wrap->SetReturnValue(args);
   } else {  // fstat(fd, undefined, ctx)
     CHECK_EQ(argc, 3);
     fs_req_wrap req_wrap;
@@ -852,7 +831,6 @@ static void Link(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {  // link(src, dest, req)
     AsyncDestCall(env, req_wrap, args, "link", *dest, dest.length(), UTF8,
                   AfterNoArgs, uv_fs_link, *src, *dest);
-    req_wrap->SetReturnValue(args);
   } else {  // link(src, dest)
     CHECK_EQ(argc, 4);
     fs_req_wrap req;
@@ -876,13 +854,12 @@ static void ReadLink(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {  // readlink(path, encoding, req)
     AsyncCall(env, req_wrap, args, "readlink", encoding, AfterStringPtr,
               uv_fs_readlink, *path);
-    req_wrap->SetReturnValue(args);
   } else {
     CHECK_EQ(argc, 4);
     fs_req_wrap req;
     int err = SyncCall(env, args[3], &req, "readlink",
                        uv_fs_readlink, *path);
-    if (err) {
+    if (err < 0) {
       return;  // syscall failed, no need to continue, error info is in ctx
     }
     const char* link_path = static_cast<const char*>(req.req.ptr);
@@ -917,7 +894,6 @@ static void Rename(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {
     AsyncDestCall(env, req_wrap, args, "rename", *new_path, new_path.length(),
                   UTF8, AfterNoArgs, uv_fs_rename, *old_path, *new_path);
-    req_wrap->SetReturnValue(args);
   } else {
     CHECK_EQ(argc, 4);
     fs_req_wrap req;
@@ -941,7 +917,6 @@ static void FTruncate(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {
     AsyncCall(env, req_wrap, args, "ftruncate", UTF8, AfterNoArgs,
               uv_fs_ftruncate, fd, len);
-    req_wrap->SetReturnValue(args);
   } else {
     CHECK_EQ(argc, 4);
     fs_req_wrap req;
@@ -962,7 +937,6 @@ static void Fdatasync(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {
     AsyncCall(env, req_wrap, args, "fdatasync", UTF8, AfterNoArgs,
               uv_fs_fdatasync, fd);
-    req_wrap->SetReturnValue(args);
   } else {
     CHECK_EQ(argc, 3);
     fs_req_wrap req;
@@ -983,7 +957,6 @@ static void Fsync(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {
     AsyncCall(env, req_wrap, args, "fsync", UTF8, AfterNoArgs,
               uv_fs_fsync, fd);
-    req_wrap->SetReturnValue(args);
   } else {
     CHECK_EQ(argc, 3);
     fs_req_wrap req;
@@ -1004,7 +977,6 @@ static void Unlink(const FunctionCallbackInfo<Value>& args) {
   if (req_wrap != nullptr) {
     AsyncCall(env, req_wrap, args, "unlink", UTF8, AfterNoArgs,
               uv_fs_unlink, *path);
-    req_wrap->SetReturnValue(args);
   } else {
     CHECK_EQ(argc, 3);
     fs_req_wrap req;
@@ -1015,58 +987,73 @@ static void Unlink(const FunctionCallbackInfo<Value>& args) {
 static void RMDir(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_GE(args.Length(), 1);
+  const int argc = args.Length();
+  CHECK_GE(argc, 2);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
-  FSReqBase* req_wrap = GetReqWrap(env, args[1]);
+  FSReqBase* req_wrap = GetReqWrap(env, args[1]);  // rmdir(path, req)
   if (req_wrap != nullptr) {
     AsyncCall(env, req_wrap, args, "rmdir", UTF8, AfterNoArgs,
               uv_fs_rmdir, *path);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(rmdir, *path, *path)
+  } else {  // rmdir(path, undefined, ctx)
+    CHECK_EQ(argc, 3);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[2], &req_wrap, "rmdir",
+             uv_fs_rmdir, *path);
   }
 }
 
 static void MKDir(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_GE(args.Length(), 2);
-  CHECK(args[1]->IsInt32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
-  int mode = static_cast<int>(args[1]->Int32Value());
+  CHECK(args[1]->IsInt32());
+  const int mode = args[1].As<Int32>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[2]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // mkdir(path, mode, req)
     AsyncCall(env, req_wrap, args, "mkdir", UTF8, AfterNoArgs,
               uv_fs_mkdir, *path, mode);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(mkdir, *path, *path, mode)
+  } else {  // mkdir(path, mode, undefined, ctx)
+    CHECK_EQ(argc, 4);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[3], &req_wrap, "mkdir",
+             uv_fs_mkdir, *path, mode);
   }
 }
 
 static void RealPath(const FunctionCallbackInfo<Value>& args) {
-  CHECK_GE(args.Length(), 2);
   Environment* env = Environment::GetCurrent(args);
+
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
+
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
   const enum encoding encoding = ParseEncoding(env->isolate(), args[1], UTF8);
 
   FSReqBase* req_wrap = GetReqWrap(env, args[2]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // realpath(path, encoding, req)
     AsyncCall(env, req_wrap, args, "realpath", encoding, AfterStringPtr,
               uv_fs_realpath, *path);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(realpath, *path, *path);
-    const char* link_path = static_cast<const char*>(SYNC_REQ.ptr);
+  } else {  // realpath(path, encoding, undefined, ctx)
+    CHECK_EQ(argc, 4);
+    fs_req_wrap req_wrap;
+    int err = SyncCall(env, args[3], &req_wrap, "realpath",
+                       uv_fs_realpath, *path);
+    if (err < 0) {
+      return;  // syscall failed, no need to continue, error info is in ctx
+    }
+
+    const char* link_path = static_cast<const char*>(req_wrap.req.ptr);
 
     Local<Value> error;
     MaybeLocal<Value> rc = StringBytes::Encode(env->isolate(),
@@ -1074,9 +1061,11 @@ static void RealPath(const FunctionCallbackInfo<Value>& args) {
                                                encoding,
                                                &error);
     if (rc.IsEmpty()) {
-      env->isolate()->ThrowException(error);
+      Local<Object> ctx = args[3].As<Object>();
+      ctx->Set(env->context(), env->error_string(), error).FromJust();
       return;
     }
+
     args.GetReturnValue().Set(rc.ToLocalChecked());
   }
 }
@@ -1084,7 +1073,8 @@ static void RealPath(const FunctionCallbackInfo<Value>& args) {
 static void ReadDir(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_GE(args.Length(), 1);
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
@@ -1092,14 +1082,19 @@ static void ReadDir(const FunctionCallbackInfo<Value>& args) {
   const enum encoding encoding = ParseEncoding(env->isolate(), args[1], UTF8);
 
   FSReqBase* req_wrap = GetReqWrap(env, args[2]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // readdir(path, encoding, req)
     AsyncCall(env, req_wrap, args, "scandir", encoding, AfterScanDir,
               uv_fs_scandir, *path, 0 /*flags*/);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(scandir, *path, *path, 0 /*flags*/)
+  } else {  // readdir(path, encoding, undefined, ctx)
+    CHECK_EQ(argc, 4);
+    fs_req_wrap req_wrap;
+    int err = SyncCall(env, args[3], &req_wrap, "scandir",
+                       uv_fs_scandir, *path, 0 /*flags*/);
+    if (err < 0) {
+      return;  // syscall failed, no need to continue, error info is in ctx
+    }
 
-    CHECK_GE(SYNC_REQ.result, 0);
+    CHECK_GE(req_wrap.req.result, 0);
     int r;
     Local<Array> names = Array::New(env->isolate(), 0);
     Local<Function> fn = env->push_values_to_array_function();
@@ -1109,11 +1104,17 @@ static void ReadDir(const FunctionCallbackInfo<Value>& args) {
     for (int i = 0; ; i++) {
       uv_dirent_t ent;
 
-      r = uv_fs_scandir_next(&SYNC_REQ, &ent);
+      r = uv_fs_scandir_next(&(req_wrap.req), &ent);
       if (r == UV_EOF)
         break;
-      if (r != 0)
-        return env->ThrowUVException(r, "readdir", "", *path);
+      if (r != 0) {
+        Local<Object> ctx = args[3].As<Object>();
+        ctx->Set(env->context(), env->errno_string(),
+                 Integer::New(env->isolate(), r)).FromJust();
+        ctx->Set(env->context(), env->syscall_string(),
+                 OneByteString(env->isolate(), "readdir")).FromJust();
+        return;
+      }
 
       Local<Value> error;
       MaybeLocal<Value> filename = StringBytes::Encode(env->isolate(),
@@ -1121,21 +1122,28 @@ static void ReadDir(const FunctionCallbackInfo<Value>& args) {
                                                        encoding,
                                                        &error);
       if (filename.IsEmpty()) {
-        env->isolate()->ThrowException(error);
+        Local<Object> ctx = args[3].As<Object>();
+        ctx->Set(env->context(), env->error_string(), error).FromJust();
         return;
       }
 
       name_v[name_idx++] = filename.ToLocalChecked();
 
       if (name_idx >= arraysize(name_v)) {
-        fn->Call(env->context(), names, name_idx, name_v)
-            .ToLocalChecked();
+        MaybeLocal<Value> ret = fn->Call(env->context(), names, name_idx,
+                                         name_v);
+        if (ret.IsEmpty()) {
+          return;
+        }
         name_idx = 0;
       }
     }
 
     if (name_idx > 0) {
-      fn->Call(env->context(), names, name_idx, name_v).ToLocalChecked();
+      MaybeLocal<Value> ret = fn->Call(env->context(), names, name_idx, name_v);
+      if (ret.IsEmpty()) {
+        return;
+      }
     }
 
     args.GetReturnValue().Set(names);
@@ -1144,79 +1152,90 @@ static void ReadDir(const FunctionCallbackInfo<Value>& args) {
 
 static void Open(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
-  Local<Context> context = env->context();
 
-  CHECK_GE(args.Length(), 3);
-  CHECK(args[1]->IsInt32());
-  CHECK(args[2]->IsInt32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
-  int flags = args[1]->Int32Value(context).ToChecked();
-  int mode = args[2]->Int32Value(context).ToChecked();
+  CHECK(args[1]->IsInt32());
+  const int flags = args[1].As<Int32>()->Value();
+
+  CHECK(args[2]->IsInt32());
+  const int mode = args[2].As<Int32>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // open(path, flags, mode, req)
     AsyncCall(env, req_wrap, args, "open", UTF8, AfterInteger,
               uv_fs_open, *path, flags, mode);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(open, *path, *path, flags, mode)
-    args.GetReturnValue().Set(SYNC_RESULT);
+  } else {  // open(path, flags, mode, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    int result = SyncCall(env, args[4], &req_wrap, "open",
+                          uv_fs_open, *path, flags, mode);
+    args.GetReturnValue().Set(result);
   }
 }
 
 static void OpenFileHandle(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
-  Local<Context> context = env->context();
 
-  CHECK_GE(args.Length(), 3);
-  CHECK(args[1]->IsInt32());
-  CHECK(args[2]->IsInt32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
-  int flags = args[1]->Int32Value(context).ToChecked();
-  int mode = args[2]->Int32Value(context).ToChecked();
+  CHECK(args[1]->IsInt32());
+  const int flags = args[1].As<Int32>()->Value();
+
+  CHECK(args[2]->IsInt32());
+  const int mode = args[2].As<Int32>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // openFileHandle(path, flags, mode, req)
     AsyncCall(env, req_wrap, args, "open", UTF8, AfterOpenFileHandle,
               uv_fs_open, *path, flags, mode);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(open, *path, *path, flags, mode)
-    if (SYNC_RESULT < 0) {
-      args.GetReturnValue().Set(SYNC_RESULT);
-    } else {
-      HandleScope scope(env->isolate());
-      FileHandle* fd = new FileHandle(env, SYNC_RESULT);
-      args.GetReturnValue().Set(fd->object());
+  } else {  // openFileHandle(path, flags, mode, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    int result = SyncCall(env, args[4], &req_wrap, "open",
+                          uv_fs_open, *path, flags, mode);
+    if (result < 0) {
+      return;  // syscall failed, no need to continue, error info is in ctx
     }
+    HandleScope scope(env->isolate());
+    FileHandle* fd = new FileHandle(env, result);
+    args.GetReturnValue().Set(fd->object());
   }
 }
 
 static void CopyFile(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_GE(args.Length(), 3);
-  CHECK(args[2]->IsInt32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
   BufferValue src(env->isolate(), args[0]);
   CHECK_NE(*src, nullptr);
+
   BufferValue dest(env->isolate(), args[1]);
   CHECK_NE(*dest, nullptr);
-  int flags = args[2]->Int32Value();
+
+  CHECK(args[2]->IsInt32());
+  const int flags = args[2].As<Int32>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
-    AsyncCall(env, req_wrap, args, "copyfile", UTF8, AfterNoArgs,
-              uv_fs_copyfile, *src, *dest, flags);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_DEST_CALL(copyfile, *src, *dest, *src, *dest, flags)
+  if (req_wrap != nullptr) {  // copyFile(src, dest, flags, req)
+    AsyncDestCall(env, req_wrap, args, "copyfile",
+                  *dest, dest.length(), UTF8, AfterNoArgs,
+                  uv_fs_copyfile, *src, *dest, flags);
+  } else {  // copyFile(src, dest, flags, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[4], &req_wrap, "copyfile",
+             uv_fs_copyfile, *src, *dest, flags);
   }
 }
 
@@ -1233,35 +1252,43 @@ static void CopyFile(const FunctionCallbackInfo<Value>& args) {
 static void WriteBuffer(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
+  const int argc = args.Length();
+  CHECK_GE(argc, 4);
+
   CHECK(args[0]->IsInt32());
+  const int fd = args[0].As<Int32>()->Value();
+
   CHECK(Buffer::HasInstance(args[1]));
+  Local<Object> buffer_obj = args[1].As<Object>();
+  char* buffer_data = Buffer::Data(buffer_obj);
+  size_t buffer_length = Buffer::Length(buffer_obj);
 
-  int fd = args[0]->Int32Value();
-  Local<Object> obj = args[1].As<Object>();
-  const char* buf = Buffer::Data(obj);
-  size_t buffer_length = Buffer::Length(obj);
-  size_t off = args[2]->Uint32Value();
-  size_t len = args[3]->Uint32Value();
-  int64_t pos = GET_OFFSET(args[4]);
-
+  CHECK(args[2]->IsInt32());
+  const size_t off = static_cast<size_t>(args[2].As<Int32>()->Value());
   CHECK_LE(off, buffer_length);
+
+  CHECK(args[3]->IsInt32());
+  const size_t len = static_cast<size_t>(args[3].As<Int32>()->Value());
+  CHECK(Buffer::IsWithinBounds(off, len, buffer_length));
   CHECK_LE(len, buffer_length);
   CHECK_GE(off + len, off);
-  CHECK(Buffer::IsWithinBounds(off, len, buffer_length));
 
-  buf += off;
+  const int64_t pos = GET_OFFSET(args[4]);
 
+  char* buf = buffer_data + off;
   uv_buf_t uvbuf = uv_buf_init(const_cast<char*>(buf), len);
 
   FSReqBase* req_wrap = GetReqWrap(env, args[5]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // write(fd, buffer, off, len, pos, req)
     AsyncCall(env, req_wrap, args, "write", UTF8, AfterInteger,
               uv_fs_write, fd, &uvbuf, 1, pos);
-    return req_wrap->SetReturnValue(args);
+  } else {  // write(fd, buffer, off, len, pos, undefined, ctx)
+    CHECK_EQ(argc, 7);
+    fs_req_wrap req_wrap;
+    int bytesWritten = SyncCall(env, args[6], &req_wrap, "write",
+                                uv_fs_write, fd, &uvbuf, 1, pos);
+    args.GetReturnValue().Set(bytesWritten);
   }
-
-  SYNC_CALL(write, nullptr, fd, &uvbuf, 1, pos)
-  args.GetReturnValue().Set(SYNC_RESULT);
 }
 
 
@@ -1275,11 +1302,15 @@ static void WriteBuffer(const FunctionCallbackInfo<Value>& args) {
 static void WriteBuffers(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK(args[0]->IsInt32());
-  CHECK(args[1]->IsArray());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
-  int fd = args[0]->Int32Value();
+  CHECK(args[0]->IsInt32());
+  const int fd = args[0].As<Int32>()->Value();
+
+  CHECK(args[1]->IsArray());
   Local<Array> chunks = args[1].As<Array>();
+
   int64_t pos = GET_OFFSET(args[2]);
 
   MaybeStackBuffer<uv_buf_t> iovs(chunks->Length());
@@ -1291,14 +1322,16 @@ static void WriteBuffers(const FunctionCallbackInfo<Value>& args) {
   }
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // writeBuffers(fd, chunks, pos, req)
     AsyncCall(env, req_wrap, args, "write", UTF8, AfterInteger,
               uv_fs_write, fd, *iovs, iovs.length(), pos);
-    return req_wrap->SetReturnValue(args);
+  } else {  // writeBuffers(fd, chunks, pos, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    int bytesWritten = SyncCall(env, args[4], &req_wrap, "write",
+                                uv_fs_write, fd, *iovs, iovs.length(), pos);
+    args.GetReturnValue().Set(bytesWritten);
   }
-
-  SYNC_CALL(write, nullptr, fd, *iovs, iovs.length(), pos)
-  args.GetReturnValue().Set(SYNC_RESULT);
 }
 
 
@@ -1313,19 +1346,23 @@ static void WriteBuffers(const FunctionCallbackInfo<Value>& args) {
 static void WriteString(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK(args[0]->IsInt32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 4);
 
-  std::unique_ptr<char[]> delete_on_return;
-  Local<Value> req;
-  Local<Value> value = args[1];
-  int fd = args[0]->Int32Value();
-  char* buf = nullptr;
-  size_t len;
+  CHECK(args[0]->IsInt32());
+  const int fd = args[0].As<Int32>()->Value();
+
   const int64_t pos = GET_OFFSET(args[2]);
+
   const auto enc = ParseEncoding(env->isolate(), args[3], UTF8);
 
+  std::unique_ptr<char[]> delete_on_return;
+  Local<Value> value = args[1];
+  char* buf = nullptr;
+  size_t len;
+
   FSReqBase* req_wrap = GetReqWrap(env, args[4]);
-  const auto is_async = req_wrap != nullptr;
+  const bool is_async = req_wrap != nullptr;
 
   // Avoid copying the string when it is externalized but only when:
   // 1. The target encoding is compatible with the string's encoding, and
@@ -1359,13 +1396,15 @@ static void WriteString(const FunctionCallbackInfo<Value>& args) {
 
   uv_buf_t uvbuf = uv_buf_init(buf, len);
 
-  if (req_wrap != nullptr) {
+  if (is_async) {  // write(fd, string, pos, enc, req)
     AsyncCall(env, req_wrap, args, "write", UTF8, AfterInteger,
               uv_fs_write, fd, &uvbuf, 1, pos);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(write, nullptr, fd, &uvbuf, 1, pos)
-    return args.GetReturnValue().Set(SYNC_RESULT);
+  } else {  // write(fd, string, pos, enc, undefined, ctx)
+    CHECK_EQ(argc, 6);
+    fs_req_wrap req_wrap;
+    int bytesWritten = SyncCall(env, args[5], &req_wrap, "write",
+                                uv_fs_write, fd, &uvbuf, 1, pos);
+    args.GetReturnValue().Set(bytesWritten);
   }
 }
 
@@ -1375,52 +1414,50 @@ static void WriteString(const FunctionCallbackInfo<Value>& args) {
  *
  * bytesRead = fs.read(fd, buffer, offset, length, position)
  *
- * 0 fd        integer. file descriptor
+ * 0 fd        int32. file descriptor
  * 1 buffer    instance of Buffer
- * 2 offset    integer. offset to start reading into inside buffer
- * 3 length    integer. length to read
- * 4 position  file position - null for current position
- *
+ * 2 offset    int32. offset to start reading into inside buffer
+ * 3 length    int32. length to read
+ * 4 position  int64. file position - -1 for current position
  */
 static void Read(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
+  const int argc = args.Length();
+  CHECK_GE(argc, 5);
+
   CHECK(args[0]->IsInt32());
+  const int fd = args[0].As<Int32>()->Value();
+
   CHECK(Buffer::HasInstance(args[1]));
-
-  int fd = args[0]->Int32Value();
-
-  Local<Value> req;
-
-  size_t len;
-  int64_t pos;
-
-  char * buf = nullptr;
-
   Local<Object> buffer_obj = args[1].As<Object>();
-  char *buffer_data = Buffer::Data(buffer_obj);
+  char* buffer_data = Buffer::Data(buffer_obj);
   size_t buffer_length = Buffer::Length(buffer_obj);
 
-  size_t off = args[2]->Int32Value();
+  CHECK(args[2]->IsInt32());
+  const size_t off = static_cast<size_t>(args[2].As<Int32>()->Value());
   CHECK_LT(off, buffer_length);
 
-  len = args[3]->Int32Value();
+  CHECK(args[3]->IsInt32());
+  const size_t len = static_cast<size_t>(args[3].As<Int32>()->Value());
   CHECK(Buffer::IsWithinBounds(off, len, buffer_length));
 
-  pos = GET_OFFSET(args[4]);
+  CHECK(args[4]->IsNumber());
+  const int64_t pos = args[4].As<Integer>()->Value();
 
-  buf = buffer_data + off;
-
+  char* buf = buffer_data + off;
   uv_buf_t uvbuf = uv_buf_init(const_cast<char*>(buf), len);
 
   FSReqBase* req_wrap = GetReqWrap(env, args[5]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // read(fd, buffer, offset, len, pos, req)
     AsyncCall(env, req_wrap, args, "read", UTF8, AfterInteger,
               uv_fs_read, fd, &uvbuf, 1, pos);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(read, 0, fd, &uvbuf, 1, pos)
-    args.GetReturnValue().Set(SYNC_RESULT);
+  } else {  // read(fd, buffer, offset, len, pos, undefined, ctx)
+    CHECK_EQ(argc, 7);
+    fs_req_wrap req_wrap;
+    const int bytesRead = SyncCall(env, args[6], &req_wrap, "read",
+                                   uv_fs_read, fd, &uvbuf, 1, pos);
+    args.GetReturnValue().Set(bytesRead);
   }
 }
 
@@ -1431,21 +1468,24 @@ static void Read(const FunctionCallbackInfo<Value>& args) {
 static void Chmod(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_GE(args.Length(), 2);
-  CHECK(args[1]->IsInt32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 2);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
-  int mode = static_cast<int>(args[1]->Int32Value());
+  CHECK(args[1]->IsInt32());
+  int mode = args[1].As<Int32>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[2]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // chmod(path, mode, req)
     AsyncCall(env, req_wrap, args, "chmod", UTF8, AfterNoArgs,
               uv_fs_chmod, *path, mode);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(chmod, *path, *path, mode);
+  } else {  // chmod(path, mode, undefined, ctx)
+    CHECK_EQ(argc, 4);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[3], &req_wrap, "chmod",
+             uv_fs_chmod, *path, mode);
   }
 }
 
@@ -1456,19 +1496,24 @@ static void Chmod(const FunctionCallbackInfo<Value>& args) {
 static void FChmod(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK(args[0]->IsInt32());
-  CHECK(args[1]->IsInt32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 2);
 
-  int fd = args[0]->Int32Value();
-  int mode = static_cast<int>(args[1]->Int32Value());
+  CHECK(args[0]->IsInt32());
+  const int fd = args[0].As<Int32>()->Value();
+
+  CHECK(args[1]->IsInt32());
+  const int mode = args[1].As<Int32>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[2]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // fchmod(fd, mode, req)
     AsyncCall(env, req_wrap, args, "fchmod", UTF8, AfterNoArgs,
               uv_fs_fchmod, fd, mode);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(fchmod, 0, fd, mode);
+  } else {  // fchmod(fd, mode, undefined, ctx)
+    CHECK_EQ(argc, 4);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[3], &req_wrap, "fchmod",
+             uv_fs_fchmod, fd, mode);
   }
 }
 
@@ -1479,24 +1524,27 @@ static void FChmod(const FunctionCallbackInfo<Value>& args) {
 static void Chown(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  int len = args.Length();
-  CHECK_GE(len, 3);
-  CHECK(args[1]->IsUint32());
-  CHECK(args[2]->IsUint32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
-  uv_uid_t uid = static_cast<uv_uid_t>(args[1]->Uint32Value());
-  uv_gid_t gid = static_cast<uv_gid_t>(args[2]->Uint32Value());
+  CHECK(args[1]->IsUint32());
+  const uv_uid_t uid = static_cast<uv_uid_t>(args[1].As<Uint32>()->Value());
+
+  CHECK(args[2]->IsUint32());
+  const uv_gid_t gid = static_cast<uv_gid_t>(args[2].As<Uint32>()->Value());
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // chown(path, uid, gid, req)
     AsyncCall(env, req_wrap, args, "chown", UTF8, AfterNoArgs,
               uv_fs_chown, *path, uid, gid);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(chown, *path, *path, uid, gid);
+  } else {  // chown(path, uid, gid, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[4], &req_wrap, "chown",
+             uv_fs_chown, *path, uid, gid);
   }
 }
 
@@ -1507,21 +1555,27 @@ static void Chown(const FunctionCallbackInfo<Value>& args) {
 static void FChown(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK(args[0]->IsInt32());
-  CHECK(args[1]->IsUint32());
-  CHECK(args[2]->IsUint32());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
-  int fd = args[0]->Int32Value();
-  uv_uid_t uid = static_cast<uv_uid_t>(args[1]->Uint32Value());
-  uv_gid_t gid = static_cast<uv_gid_t>(args[2]->Uint32Value());
+  CHECK(args[0]->IsInt32());
+  const int fd = args[0].As<Int32>()->Value();
+
+  CHECK(args[1]->IsUint32());
+  const uv_uid_t uid = static_cast<uv_uid_t>(args[1].As<Uint32>()->Value());
+
+  CHECK(args[2]->IsUint32());
+  const uv_gid_t gid = static_cast<uv_gid_t>(args[2].As<Uint32>()->Value());
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // fchown(fd, uid, gid, req)
     AsyncCall(env, req_wrap, args, "fchown", UTF8, AfterNoArgs,
               uv_fs_fchown, fd, uid, gid);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(fchown, 0, fd, uid, gid);
+  } else {  // fchown(fd, uid, gid, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[4], &req_wrap, "fchown",
+             uv_fs_fchown, fd, uid, gid);
   }
 }
 
@@ -1529,51 +1583,62 @@ static void FChown(const FunctionCallbackInfo<Value>& args) {
 static void UTimes(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_GE(args.Length(), 3);
-  CHECK(args[1]->IsNumber());
-  CHECK(args[2]->IsNumber());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NE(*path, nullptr);
 
-  const double atime = static_cast<double>(args[1]->NumberValue());
-  const double mtime = static_cast<double>(args[2]->NumberValue());
+  CHECK(args[1]->IsNumber());
+  const double atime = args[1].As<Number>()->Value();
+
+  CHECK(args[2]->IsNumber());
+  const double mtime = args[2].As<Number>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // utimes(path, atime, mtime, req)
     AsyncCall(env, req_wrap, args, "utime", UTF8, AfterNoArgs,
               uv_fs_utime, *path, atime, mtime);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(utime, *path, *path, atime, mtime);
+  } else {  // utimes(path, atime, mtime, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[4], &req_wrap, "utime",
+             uv_fs_utime, *path, atime, mtime);
   }
 }
 
 static void FUTimes(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK(args[0]->IsInt32());
-  CHECK(args[1]->IsNumber());
-  CHECK(args[2]->IsNumber());
+  const int argc = args.Length();
+  CHECK_GE(argc, 3);
 
-  const int fd = args[0]->Int32Value();
-  const double atime = static_cast<double>(args[1]->NumberValue());
-  const double mtime = static_cast<double>(args[2]->NumberValue());
+  CHECK(args[0]->IsInt32());
+  const int fd = args[0].As<Int32>()->Value();
+
+  CHECK(args[1]->IsNumber());
+  const double atime = args[1].As<Number>()->Value();
+
+  CHECK(args[2]->IsNumber());
+  const double mtime = args[2].As<Number>()->Value();
 
   FSReqBase* req_wrap = GetReqWrap(env, args[3]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // futimes(fd, atime, mtime, req)
     AsyncCall(env, req_wrap, args, "futime", UTF8, AfterNoArgs,
               uv_fs_futime, fd, atime, mtime);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(futime, 0, fd, atime, mtime);
+  } else {  // futimes(fd, atime, mtime, undefined, ctx)
+    CHECK_EQ(argc, 5);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[4], &req_wrap, "futime",
+             uv_fs_futime, fd, atime, mtime);
   }
 }
 
 static void Mkdtemp(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_GE(args.Length(), 2);
+  const int argc = args.Length();
+  CHECK_GE(argc, 2);
 
   BufferValue tmpl(env->isolate(), args[0]);
   CHECK_NE(*tmpl, nullptr);
@@ -1581,19 +1646,22 @@ static void Mkdtemp(const FunctionCallbackInfo<Value>& args) {
   const enum encoding encoding = ParseEncoding(env->isolate(), args[1], UTF8);
 
   FSReqBase* req_wrap = GetReqWrap(env, args[2]);
-  if (req_wrap != nullptr) {
+  if (req_wrap != nullptr) {  // mkdtemp(tmpl, encoding, req)
     AsyncCall(env, req_wrap, args, "mkdtemp", encoding, AfterStringPath,
               uv_fs_mkdtemp, *tmpl);
-    req_wrap->SetReturnValue(args);
-  } else {
-    SYNC_CALL(mkdtemp, *tmpl, *tmpl);
-    const char* path = static_cast<const char*>(SYNC_REQ.path);
+  } else {  // mkdtemp(tmpl, encoding, undefined, ctx)
+    CHECK_EQ(argc, 4);
+    fs_req_wrap req_wrap;
+    SyncCall(env, args[3], &req_wrap, "mkdtemp",
+             uv_fs_mkdtemp, *tmpl);
+    const char* path = static_cast<const char*>(req_wrap.req.path);
 
     Local<Value> error;
     MaybeLocal<Value> rc =
         StringBytes::Encode(env->isolate(), path, encoding, &error);
     if (rc.IsEmpty()) {
-      env->isolate()->ThrowException(error);
+      Local<Object> ctx = args[3].As<Object>();
+      ctx->Set(env->context(), env->error_string(), error).FromJust();
       return;
     }
     args.GetReturnValue().Set(rc.ToLocalChecked());

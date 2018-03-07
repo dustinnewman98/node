@@ -4,6 +4,7 @@
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
 #include "node.h"
+#include "node_internals.h"
 #include "node_perf_common.h"
 #include "env.h"
 #include "base_object-inl.h"
@@ -21,6 +22,10 @@ using v8::GCType;
 using v8::Local;
 using v8::Object;
 using v8::Value;
+
+extern const uint64_t timeOrigin;
+
+double GetCurrentTimeInMicroseconds();
 
 static inline PerformanceMilestone ToPerformanceMilestoneEnum(const char* str) {
 #define V(name, label)                                                        \
@@ -77,11 +82,11 @@ class PerformanceEntry {
     return ToPerformanceEntryTypeEnum(type().c_str());
   }
 
-  double startTime() const { return startTime_ / 1e6; }
+  double startTime() const { return startTimeNano() / 1e6; }
 
   double duration() const { return durationNano() / 1e6; }
 
-  uint64_t startTimeNano() const { return startTime_; }
+  uint64_t startTimeNano() const { return startTime_ - timeOrigin; }
 
   uint64_t durationNano() const { return endTime_ - startTime_; }
 

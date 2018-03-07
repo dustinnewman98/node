@@ -49,10 +49,6 @@
 #include "node_dtrace.h"
 #endif
 
-#if defined HAVE_LTTNG
-#include "node_lttng.h"
-#endif
-
 #include "ares.h"
 #include "async_wrap-inl.h"
 #include "env-inl.h"
@@ -172,7 +168,7 @@ using v8::Undefined;
 using v8::V8;
 using v8::Value;
 
-using AsyncHooks = node::Environment::AsyncHooks;
+using AsyncHooks = Environment::AsyncHooks;
 
 static bool print_eval = false;
 static bool force_repl = false;
@@ -196,6 +192,8 @@ static node_module* modlist_linked;
 static node_module* modlist_addon;
 static bool trace_enabled = false;
 static std::string trace_enabled_categories;  // NOLINT(runtime/string)
+static std::string trace_file_pattern =  // NOLINT(runtime/string)
+  "node_trace.${rotation}.log";
 static bool abort_on_uncaught_exception = false;
 
 // Bit flag used to track security reverts (see node_revert.h)
@@ -273,13 +271,13 @@ static double prog_start_time;
 static Mutex node_isolate_mutex;
 static v8::Isolate* node_isolate;
 
-node::DebugOptions debug_options;
+DebugOptions debug_options;
 
 static struct {
 #if NODE_USE_V8_PLATFORM
   void Initialize(int thread_pool_size) {
     if (trace_enabled) {
-      tracing_agent_.reset(new tracing::Agent());
+      tracing_agent_.reset(new tracing::Agent(trace_file_pattern));
       platform_ = new NodePlatform(thread_pool_size,
         tracing_agent_->GetTracingController());
       V8::InitializePlatform(platform_);
@@ -311,7 +309,7 @@ static struct {
 
 #if HAVE_INSPECTOR
   bool StartInspector(Environment *env, const char* script_path,
-                      const node::DebugOptions& options) {
+                      const DebugOptions& options) {
     // Inspector agent can't fail to start, but if it was configured to listen
     // right away on the websocket port and fails to bind/etc, this will return
     // false.
@@ -343,7 +341,7 @@ static struct {
   void DrainVMTasks(Isolate* isolate) {}
   void CancelVMTasks(Isolate* isolate) {}
   bool StartInspector(Environment *env, const char* script_path,
-                      const node::DebugOptions& options) {
+                      const DebugOptions& options) {
     env->ThrowError("Node compiled with NODE_USE_V8_PLATFORM=0");
     return true;
   }
@@ -780,9 +778,9 @@ Local<Value> WinapiErrnoException(Isolate* isolate,
 
 void* ArrayBufferAllocator::Allocate(size_t size) {
   if (zero_fill_field_ || zero_fill_all_buffers)
-    return node::UncheckedCalloc(size);
+    return UncheckedCalloc(size);
   else
-    return node::UncheckedMalloc(size);
+    return UncheckedMalloc(size);
 }
 
 namespace {
@@ -1582,7 +1580,7 @@ static void Chdir(const FunctionCallbackInfo<Value>& args) {
   node::Utf8Value path(args.GetIsolate(), args[0]);
   int err = uv_chdir(*path);
   if (err) {
-    return env->ThrowUVException(err, "uv_chdir");
+    return env->ThrowUVException(err, "chdir", nullptr, *path, nullptr);
   }
 }
 
@@ -2147,46 +2145,82 @@ node_module* get_linked_module(const char* name) {
 }
 
 struct DLib {
-  std::string filename_;
-  std::string errmsg_;
-  void* handle_;
-  int flags_;
-
 #ifdef __POSIX__
   static const int kDefaultFlags = RTLD_LAZY;
-
-  bool Open() {
-    handle_ = dlopen(filename_.c_str(), flags_);
-    if (handle_ != nullptr)
-      return true;
-    errmsg_ = dlerror();
-    return false;
-  }
-
-  void Close() {
-    if (handle_ != nullptr)
-      dlclose(handle_);
-  }
-#else  // !__POSIX__
+#else
   static const int kDefaultFlags = 0;
+#endif
+
+  inline DLib(const char* filename, int flags)
+      : filename_(filename), flags_(flags), handle_(nullptr) {}
+
+  inline bool Open();
+  inline void Close();
+  inline void* GetSymbolAddress(const char* name);
+
+  const std::string filename_;
+  const int flags_;
+  std::string errmsg_;
+  void* handle_;
+#ifndef __POSIX__
   uv_lib_t lib_;
+#endif
 
-  bool Open() {
-    int ret = uv_dlopen(filename_.c_str(), &lib_);
-    if (ret == 0) {
-      handle_ = static_cast<void*>(lib_.handle);
-      return true;
-    }
-    errmsg_ = uv_dlerror(&lib_);
-    uv_dlclose(&lib_);
-    return false;
-  }
-
-  void Close() {
-    uv_dlclose(&lib_);
-  }
-#endif  // !__POSIX__
+  DISALLOW_COPY_AND_ASSIGN(DLib);
 };
+
+
+#ifdef __POSIX__
+bool DLib::Open() {
+  handle_ = dlopen(filename_.c_str(), flags_);
+  if (handle_ != nullptr)
+    return true;
+  errmsg_ = dlerror();
+  return false;
+}
+
+void DLib::Close() {
+  if (handle_ == nullptr) return;
+  dlclose(handle_);
+  handle_ = nullptr;
+}
+
+void* DLib::GetSymbolAddress(const char* name) {
+  return dlsym(handle_, name);
+}
+#else  // !__POSIX__
+bool DLib::Open() {
+  int ret = uv_dlopen(filename_.c_str(), &lib_);
+  if (ret == 0) {
+    handle_ = static_cast<void*>(lib_.handle);
+    return true;
+  }
+  errmsg_ = uv_dlerror(&lib_);
+  uv_dlclose(&lib_);
+  return false;
+}
+
+void DLib::Close() {
+  if (handle_ == nullptr) return;
+  uv_dlclose(&lib_);
+  handle_ = nullptr;
+}
+
+void* DLib::GetSymbolAddress(const char* name) {
+  void* address;
+  if (0 == uv_dlsym(&lib_, name, &address)) return address;
+  return nullptr;
+}
+#endif  // !__POSIX__
+
+using InitializerCallback = void (*)(Local<Object> exports,
+                                     Local<Value> module,
+                                     Local<Context> context);
+
+inline InitializerCallback GetInitializerCallback(DLib* dlib) {
+  const char* name = "node_register_module_v" STRINGIFY(NODE_MODULE_VERSION);
+  return reinterpret_cast<InitializerCallback>(dlib->GetSymbolAddress(name));
+}
 
 // DLOpen is process.dlopen(module, filename, flags).
 // Used to load 'module.node' dynamically shared objects.
@@ -2196,6 +2230,7 @@ struct DLib {
 // cache that's a plain C list or hash table that's shared across contexts?
 static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
+  auto context = env->context();
 
   CHECK_EQ(modpending, nullptr);
 
@@ -2205,16 +2240,21 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   }
 
   int32_t flags = DLib::kDefaultFlags;
-  if (args.Length() > 2 && !args[2]->Int32Value(env->context()).To(&flags)) {
+  if (args.Length() > 2 && !args[2]->Int32Value(context).To(&flags)) {
     return env->ThrowTypeError("flag argument must be an integer.");
   }
 
-  Local<Object> module =
-      args[0]->ToObject(env->context()).ToLocalChecked();  // Cast
+  Local<Object> module;
+  Local<Object> exports;
+  Local<Value> exports_v;
+  if (!args[0]->ToObject(context).ToLocal(&module) ||
+      !module->Get(context, env->exports_string()).ToLocal(&exports_v) ||
+      !exports_v->ToObject(context).ToLocal(&exports)) {
+    return;  // Exception pending.
+  }
+
   node::Utf8Value filename(env->isolate(), args[1]);  // Cast
-  DLib dlib;
-  dlib.filename_ = *filename;
-  dlib.flags_ = flags;
+  DLib dlib(*filename, flags);
   bool is_opened = dlib.Open();
 
   // Objects containing v14 or later modules will have registered themselves
@@ -2229,17 +2269,22 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
 #ifdef _WIN32
     // Windows needs to add the filename into the error message
     errmsg = String::Concat(errmsg,
-                            args[1]->ToString(env->context()).ToLocalChecked());
+                            args[1]->ToString(context).ToLocalChecked());
 #endif  // _WIN32
     env->isolate()->ThrowException(Exception::Error(errmsg));
     return;
   }
 
   if (mp == nullptr) {
-    dlib.Close();
-    env->ThrowError("Module did not self-register.");
+    if (auto callback = GetInitializerCallback(&dlib)) {
+      callback(exports, module, context);
+    } else {
+      dlib.Close();
+      env->ThrowError("Module did not self-register.");
+    }
     return;
   }
+
   if (mp->nm_version == -1) {
     if (env->EmitNapiWarning()) {
       if (ProcessEmitWarning(env, "N-API is an experimental feature and could "
@@ -2276,22 +2321,8 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {
   mp->nm_link = modlist_addon;
   modlist_addon = mp;
 
-  Local<String> exports_string = env->exports_string();
-  MaybeLocal<Value> maybe_exports =
-      module->Get(env->context(), exports_string);
-
-  if (maybe_exports.IsEmpty() ||
-      maybe_exports.ToLocalChecked()->ToObject(env->context()).IsEmpty()) {
-    dlib.Close();
-    return;
-  }
-
-  Local<Object> exports =
-      maybe_exports.ToLocalChecked()->ToObject(env->context())
-          .FromMaybe(Local<Object>());
-
   if (mp->nm_context_register_func != nullptr) {
-    mp->nm_context_register_func(exports, module, env->context(), mp->nm_priv);
+    mp->nm_context_register_func(exports, module, context, mp->nm_priv);
   } else if (mp->nm_register_func != nullptr) {
     mp->nm_register_func(exports, module, mp->nm_priv);
   } else {
@@ -2494,7 +2525,7 @@ static void ThrowIfNoSuchModule(Environment* env, const char* module_v) {
   env->ThrowError(errmsg);
 }
 
-static void Binding(const FunctionCallbackInfo<Value>& args) {
+static void GetBinding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
   CHECK(args[0]->IsString());
@@ -2521,7 +2552,7 @@ static void Binding(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(exports);
 }
 
-static void InternalBinding(const FunctionCallbackInfo<Value>& args) {
+static void GetInternalBinding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
   CHECK(args[0]->IsString());
@@ -2536,7 +2567,7 @@ static void InternalBinding(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(exports);
 }
 
-static void LinkedBinding(const FunctionCallbackInfo<Value>& args) {
+static void GetLinkedBinding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args.GetIsolate());
 
   CHECK(args[0]->IsString());
@@ -3234,10 +3265,6 @@ void SetupProcessObject(Environment* env,
   env->SetMethod(process, "uptime", Uptime);
   env->SetMethod(process, "memoryUsage", MemoryUsage);
 
-  env->SetMethod(process, "binding", Binding);
-  env->SetMethod(process, "_linkedBinding", LinkedBinding);
-  env->SetMethod(process, "_internalBinding", InternalBinding);
-
   env->SetMethod(process, "_setupProcessObject", SetupProcessObject);
   env->SetMethod(process, "_setupNextTick", SetupNextTick);
   env->SetMethod(process, "_setupPromises", SetupPromises);
@@ -3275,8 +3302,10 @@ static void RawDebug(const FunctionCallbackInfo<Value>& args) {
   fflush(stderr);
 }
 
-void LoadEnvironment(Environment* env) {
-  HandleScope handle_scope(env->isolate());
+
+static Local<Function> GetBootstrapper(Environment* env, Local<String> source,
+                                  Local<String> script_name) {
+  EscapableHandleScope scope(env->isolate());
 
   TryCatch try_catch(env->isolate());
 
@@ -3285,30 +3314,65 @@ void LoadEnvironment(Environment* env) {
   // are not safe to ignore.
   try_catch.SetVerbose(false);
 
-  // Execute the lib/internal/bootstrap_node.js file which was included as a
-  // static C string in node_natives.h by node_js2c.
-  // 'internal_bootstrap_node_native' is the string containing that source code.
-  Local<String> script_name = FIXED_ONE_BYTE_STRING(env->isolate(),
-                                                    "bootstrap_node.js");
-  Local<Value> f_value = ExecuteString(env, MainSource(env), script_name);
+  // Execute the factory javascript file
+  Local<Value> factory_v = ExecuteString(env, source, script_name);
   if (try_catch.HasCaught())  {
     ReportException(env, try_catch);
     exit(10);
   }
-  // The bootstrap_node.js file returns a function 'f'
-  CHECK(f_value->IsFunction());
 
-  Local<Function> f = Local<Function>::Cast(f_value);
+  CHECK(factory_v->IsFunction());
+  Local<Function> factory = Local<Function>::Cast(factory_v);
+
+  return scope.Escape(factory);
+}
+
+static bool ExecuteBootstrapper(Environment* env, Local<Function> factory,
+                                int argc, Local<Value> argv[],
+                                Local<Value>* out) {
+  bool ret = factory->Call(
+      env->context(), Null(env->isolate()), argc, argv).ToLocal(out);
+
+  // If there was an error during bootstrap then it was either handled by the
+  // FatalException handler or it's unrecoverable (e.g. max call stack
+  // exceeded). Either way, clear the stack so that the AsyncCallbackScope
+  // destructor doesn't fail on the id check.
+  // There are only two ways to have a stack size > 1: 1) the user manually
+  // called MakeCallback or 2) user awaited during bootstrap, which triggered
+  // _tickCallback().
+  if (!ret) {
+    env->async_hooks()->clear_async_id_stack();
+  }
+
+  return ret;
+}
+
+
+void LoadEnvironment(Environment* env) {
+  HandleScope handle_scope(env->isolate());
+
+  TryCatch try_catch(env->isolate());
+  // Disable verbose mode to stop FatalException() handler from trying
+  // to handle the exception. Errors this early in the start-up phase
+  // are not safe to ignore.
+  try_catch.SetVerbose(false);
+
+  // The factory scripts are lib/internal/bootstrap_loaders.js and
+  // lib/internal/bootstrap_node.js, each included as a static C string
+  // defined in node_javascript.h, generated in node_javascript.cc by
+  // node_js2c.
+  Local<Function> loaders_bootstrapper =
+      GetBootstrapper(env, LoadersBootstrapperSource(env),
+                 FIXED_ONE_BYTE_STRING(env->isolate(), "bootstrap_loaders.js"));
+  Local<Function> node_bootstrapper =
+      GetBootstrapper(env, NodeBootstrapperSource(env),
+                 FIXED_ONE_BYTE_STRING(env->isolate(), "bootstrap_node.js"));
 
   // Add a reference to the global object
   Local<Object> global = env->context()->Global();
 
 #if defined HAVE_DTRACE || defined HAVE_ETW
   InitDTrace(env, global);
-#endif
-
-#if defined HAVE_LTTNG
-  InitLTTNG(env, global);
 #endif
 
 #if defined HAVE_PERFCTR
@@ -3329,25 +3393,47 @@ void LoadEnvironment(Environment* env) {
   // (Allows you to set stuff on `global` from anywhere in JavaScript.)
   global->Set(FIXED_ONE_BYTE_STRING(env->isolate(), "global"), global);
 
-  // Now we call 'f' with the 'process' variable that we've built up with
-  // all our bindings. Inside bootstrap_node.js and internal/process we'll
-  // take care of assigning things to their places.
+  // Create binding loaders
+  v8::Local<v8::Function> get_binding_fn =
+      env->NewFunctionTemplate(GetBinding)->GetFunction(env->context())
+          .ToLocalChecked();
 
-  // We start the process this way in order to be more modular. Developers
-  // who do not like how bootstrap_node.js sets up the module system but do
-  // like Node's I/O bindings may want to replace 'f' with their own function.
-  Local<Value> arg = env->process_object();
+  v8::Local<v8::Function> get_linked_binding_fn =
+      env->NewFunctionTemplate(GetLinkedBinding)->GetFunction(env->context())
+          .ToLocalChecked();
 
-  auto ret = f->Call(env->context(), Null(env->isolate()), 1, &arg);
-  // If there was an error during bootstrap then it was either handled by the
-  // FatalException handler or it's unrecoverable (e.g. max call stack
-  // exceeded). Either way, clear the stack so that the AsyncCallbackScope
-  // destructor doesn't fail on the id check.
-  // There are only two ways to have a stack size > 1: 1) the user manually
-  // called MakeCallback or 2) user awaited during bootstrap, which triggered
-  // _tickCallback().
-  if (ret.IsEmpty())
-    env->async_hooks()->clear_async_id_stack();
+  v8::Local<v8::Function> get_internal_binding_fn =
+      env->NewFunctionTemplate(GetInternalBinding)->GetFunction(env->context())
+          .ToLocalChecked();
+
+  Local<Value> loaders_bootstrapper_args[] = {
+    env->process_object(),
+    get_binding_fn,
+    get_linked_binding_fn,
+    get_internal_binding_fn
+  };
+
+  // Bootstrap internal loaders
+  Local<Value> bootstrapped_loaders;
+  if (!ExecuteBootstrapper(env, loaders_bootstrapper,
+                           arraysize(loaders_bootstrapper_args),
+                           loaders_bootstrapper_args,
+                           &bootstrapped_loaders)) {
+    return;
+  }
+
+  // Bootstrap Node.js
+  Local<Value> bootstrapped_node;
+  Local<Value> node_bootstrapper_args[] = {
+    env->process_object(),
+    bootstrapped_loaders
+  };
+  if (!ExecuteBootstrapper(env, node_bootstrapper,
+                           arraysize(node_bootstrapper_args),
+                           node_bootstrapper_args,
+                           &bootstrapped_node)) {
+    return;
+  }
 }
 
 static void PrintHelp() {
@@ -3397,6 +3483,10 @@ static void PrintHelp() {
          "  --trace-events-enabled     track trace events\n"
          "  --trace-event-categories   comma separated list of trace event\n"
          "                             categories to record\n"
+         "  --trace-event-file-pattern Template string specifying the\n"
+         "                             filepath for the trace-events data, it\n"
+         "                             supports ${rotation} and ${pid}\n"
+         "                             log-rotation id. %%2$u is the pid.\n"
          "  --track-heap-objects       track heap object allocations for heap "
          "snapshots\n"
          "  --prof-process             process v8 profiler output generated\n"
@@ -3525,6 +3615,7 @@ static void CheckIfAllowedInEnv(const char* exe, bool is_env,
     "--no-force-async-hooks-checks",
     "--trace-events-enabled",
     "--trace-event-categories",
+    "--trace-event-file-pattern",
     "--track-heap-objects",
     "--zero-fill-buffers",
     "--v8-pool-size",
@@ -3676,6 +3767,14 @@ static void ParseArgs(int* argc,
       }
       args_consumed += 1;
       trace_enabled_categories = categories;
+    } else if (strcmp(arg, "--trace-event-file-pattern") == 0) {
+      const char* file_pattern = argv[index + 1];
+      if (file_pattern == nullptr) {
+        fprintf(stderr, "%s: %s requires an argument\n", argv[0], arg);
+        exit(9);
+      }
+      args_consumed += 1;
+      trace_file_pattern = file_pattern;
     } else if (strcmp(arg, "--track-heap-objects") == 0) {
       track_heap_objects = true;
     } else if (strcmp(arg, "--throw-deprecation") == 0) {
@@ -4102,7 +4201,7 @@ void Init(int* argc,
   prog_start_time = static_cast<double>(uv_now(uv_default_loop()));
 
   // Register built-in modules
-  node::RegisterBuiltinModules();
+  RegisterBuiltinModules();
 
   // Make inherited handles noninheritable.
   uv_disable_stdio_inheritance();
@@ -4207,11 +4306,8 @@ uv_loop_t* GetCurrentEventLoop(v8::Isolate* isolate) {
 }
 
 
-static uv_key_t thread_local_env;
-
-
 void AtExit(void (*cb)(void* arg), void* arg) {
-  auto env = static_cast<Environment*>(uv_key_get(&thread_local_env));
+  auto env = Environment::GetThreadLocalEnv();
   AtExit(env, cb, arg);
 }
 
@@ -4342,8 +4438,6 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   Local<Context> context = NewContext(isolate);
   Context::Scope context_scope(context);
   Environment env(isolate_data, context);
-  CHECK_EQ(0, uv_key_create(&thread_local_env));
-  uv_key_set(&thread_local_env, &env);
   env.Start(argc, argv, exec_argc, exec_argv, v8_is_profiling);
 
   const char* path = argc > 1 ? argv[1] : nullptr;
@@ -4393,7 +4487,6 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
 
   const int exit_code = EmitExit(&env);
   RunAtExit(&env);
-  uv_key_delete(&thread_local_env);
 
   v8_platform.DrainVMTasks(isolate);
   v8_platform.CancelVMTasks(isolate);
@@ -4421,7 +4514,7 @@ inline int Start(uv_loop_t* event_loop,
 
   isolate->AddMessageListener(OnMessage);
   isolate->SetAbortOnUncaughtExceptionCallback(ShouldAbortOnUncaughtException);
-  isolate->SetAutorunMicrotasks(false);
+  isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
   isolate->SetFatalErrorHandler(OnFatalError);
 
   {
@@ -4460,7 +4553,7 @@ inline int Start(uv_loop_t* event_loop,
 int Start(int argc, char** argv) {
   atexit([] () { uv_tty_reset_mode(); });
   PlatformInit();
-  node::performance::performance_node_start = PERFORMANCE_NOW();
+  performance::performance_node_start = PERFORMANCE_NOW();
 
   CHECK_GT(argc, 0);
 
@@ -4497,7 +4590,7 @@ int Start(int argc, char** argv) {
     v8_platform.StartTracingAgent();
   }
   V8::Initialize();
-  node::performance::performance_v8_start = PERFORMANCE_NOW();
+  performance::performance_v8_start = PERFORMANCE_NOW();
   v8_initialized = true;
   const int exit_code =
       Start(uv_default_loop(), argc, argv, exec_argc, exec_argv);

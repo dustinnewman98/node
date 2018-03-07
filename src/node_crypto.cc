@@ -43,12 +43,14 @@
 // StartComAndWoSignData.inc
 #include "StartComAndWoSignData.inc"
 
-#include <algorithm>
 #include <errno.h>
 #include <limits.h>  // INT_MAX
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <algorithm>
+#include <memory>
 #include <vector>
 
 #define THROW_AND_RETURN_IF_NOT_BUFFER(val, prefix)           \
@@ -100,13 +102,18 @@ using v8::MaybeLocal;
 using v8::Null;
 using v8::Object;
 using v8::ObjectTemplate;
-using v8::Persistent;
 using v8::PropertyAttribute;
 using v8::ReadOnly;
 using v8::Signature;
 using v8::String;
 using v8::Value;
 
+
+struct StackOfX509Deleter {
+  void operator()(STACK_OF(X509)* p) const { sk_X509_pop_free(p, X509_free); }
+};
+
+using StackOfX509 = std::unique_ptr<STACK_OF(X509), StackOfX509Deleter>;
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 static void RSA_get0_key(const RSA* r, const BIGNUM** n, const BIGNUM** e,
@@ -830,17 +837,15 @@ int SSL_CTX_use_certificate_chain(SSL_CTX* ctx,
   int ret = 0;
   unsigned long err = 0;  // NOLINT(runtime/int)
 
-  // Read extra certs
-  STACK_OF(X509)* extra_certs = sk_X509_new_null();
-  if (extra_certs == nullptr) {
+  StackOfX509 extra_certs(sk_X509_new_null());
+  if (!extra_certs)
     goto done;
-  }
 
   while ((extra = PEM_read_bio_X509(in,
                                     nullptr,
                                     NoPasswordCallback,
                                     nullptr))) {
-    if (sk_X509_push(extra_certs, extra))
+    if (sk_X509_push(extra_certs.get(), extra))
       continue;
 
     // Failure, free all certs
@@ -858,13 +863,11 @@ int SSL_CTX_use_certificate_chain(SSL_CTX* ctx,
     goto done;
   }
 
-  ret = SSL_CTX_use_certificate_chain(ctx, x, extra_certs, cert, issuer);
+  ret = SSL_CTX_use_certificate_chain(ctx, x, extra_certs.get(), cert, issuer);
   if (!ret)
     goto done;
 
  done:
-  if (extra_certs != nullptr)
-    sk_X509_pop_free(extra_certs, X509_free);
   if (extra != nullptr)
     X509_free(extra);
   if (x != nullptr)
@@ -1791,6 +1794,25 @@ static bool SafeX509ExtPrint(BIO* out, X509_EXTENSION* ext) {
 }
 
 
+static void AddFingerprintDigest(const unsigned char* md,
+                                 unsigned int md_size,
+                                 char (*fingerprint)[3 * EVP_MAX_MD_SIZE + 1]) {
+  unsigned int i;
+  const char hex[] = "0123456789ABCDEF";
+
+  for (i = 0; i < md_size; i++) {
+    (*fingerprint)[3*i] = hex[(md[i] & 0xf0) >> 4];
+    (*fingerprint)[(3*i)+1] = hex[(md[i] & 0x0f)];
+    (*fingerprint)[(3*i)+2] = ':';
+  }
+
+  if (md_size > 0) {
+    (*fingerprint)[(3*(md_size-1))+2] = '\0';
+  } else {
+    (*fingerprint)[0] = '\0';
+  }
+}
+
 static Local<Object> X509ToObject(Environment* env, X509* cert) {
   EscapableHandleScope scope(env->isolate());
   Local<Context> context = env->context();
@@ -1880,6 +1902,14 @@ static Local<Object> X509ToObject(Environment* env, X509* cert) {
                                   String::kNormalString,
                                   mem->length)).FromJust();
     USE(BIO_reset(bio));
+
+    int size = i2d_RSA_PUBKEY(rsa, nullptr);
+    CHECK_GE(size, 0);
+    Local<Object> pubbuff = Buffer::New(env, size).ToLocalChecked();
+    unsigned char* pubserialized =
+        reinterpret_cast<unsigned char*>(Buffer::Data(pubbuff));
+    i2d_RSA_PUBKEY(rsa, &pubserialized);
+    info->Set(env->pubkey_string(), pubbuff);
   }
 
   if (pkey != nullptr) {
@@ -1907,26 +1937,18 @@ static Local<Object> X509ToObject(Environment* env, X509* cert) {
                                 mem->length)).FromJust();
   BIO_free_all(bio);
 
-  unsigned int md_size, i;
   unsigned char md[EVP_MAX_MD_SIZE];
+  unsigned int md_size;
+  char fingerprint[EVP_MAX_MD_SIZE * 3 + 1];
   if (X509_digest(cert, EVP_sha1(), md, &md_size)) {
-    const char hex[] = "0123456789ABCDEF";
-    char fingerprint[EVP_MAX_MD_SIZE * 3];
-
-    for (i = 0; i < md_size; i++) {
-      fingerprint[3*i] = hex[(md[i] & 0xf0) >> 4];
-      fingerprint[(3*i)+1] = hex[(md[i] & 0x0f)];
-      fingerprint[(3*i)+2] = ':';
-    }
-
-    if (md_size > 0) {
-      fingerprint[(3*(md_size-1))+2] = '\0';
-    } else {
-      fingerprint[0] = '\0';
-    }
-
-    info->Set(context, env->fingerprint_string(),
-              OneByteString(env->isolate(), fingerprint)).FromJust();
+      AddFingerprintDigest(md, md_size, &fingerprint);
+      info->Set(context, env->fingerprint_string(),
+                OneByteString(env->isolate(), fingerprint)).FromJust();
+  }
+  if (X509_digest(cert, EVP_sha256(), md, &md_size)) {
+      AddFingerprintDigest(md, md_size, &fingerprint);
+      info->Set(context, env->fingerprint256_string(),
+                OneByteString(env->isolate(), fingerprint)).FromJust();
   }
 
   STACK_OF(ASN1_OBJECT)* eku = static_cast<STACK_OF(ASN1_OBJECT)*>(
@@ -1970,109 +1992,128 @@ static Local<Object> X509ToObject(Environment* env, X509* cert) {
 }
 
 
-// TODO(indutny): Split it into multiple smaller functions
+static Local<Object> AddIssuerChainToObject(X509** cert,
+                                            Local<Object> object,
+                                            StackOfX509 peer_certs,
+                                            Environment* const env) {
+  Local<Context> context = env->isolate()->GetCurrentContext();
+  *cert = sk_X509_delete(peer_certs.get(), 0);
+  for (;;) {
+    int i;
+    for (i = 0; i < sk_X509_num(peer_certs.get()); i++) {
+      X509* ca = sk_X509_value(peer_certs.get(), i);
+      if (X509_check_issued(ca, *cert) != X509_V_OK)
+        continue;
+
+      Local<Object> ca_info = X509ToObject(env, ca);
+      object->Set(context, env->issuercert_string(), ca_info).FromJust();
+      object = ca_info;
+
+      // NOTE: Intentionally freeing cert that is not used anymore.
+      X509_free(*cert);
+
+      // Delete cert and continue aggregating issuers.
+      *cert = sk_X509_delete(peer_certs.get(), i);
+      break;
+    }
+
+    // Issuer not found, break out of the loop.
+    if (i == sk_X509_num(peer_certs.get()))
+      break;
+  }
+  return object;
+}
+
+
+static StackOfX509 CloneSSLCerts(X509** cert,
+                                 const STACK_OF(X509)* const ssl_certs) {
+  StackOfX509 peer_certs(sk_X509_new(nullptr));
+  if (*cert != nullptr)
+    sk_X509_push(peer_certs.get(), *cert);
+  for (int i = 0; i < sk_X509_num(ssl_certs); i++) {
+    *cert = X509_dup(sk_X509_value(ssl_certs, i));
+    if (*cert == nullptr)
+      return StackOfX509();
+    if (!sk_X509_push(peer_certs.get(), *cert))
+      return StackOfX509();
+  }
+  return peer_certs;
+}
+
+
+static Local<Object> GetLastIssuedCert(X509** cert,
+                                       const SSL* const ssl,
+                                       Local<Object> issuer_chain,
+                                       Environment* const env) {
+  Local<Context> context = env->isolate()->GetCurrentContext();
+  while (X509_check_issued(*cert, *cert) != X509_V_OK) {
+    X509* ca;
+    if (SSL_CTX_get_issuer(SSL_get_SSL_CTX(ssl), *cert, &ca) <= 0)
+      break;
+
+    Local<Object> ca_info = X509ToObject(env, ca);
+    issuer_chain->Set(context, env->issuercert_string(), ca_info).FromJust();
+    issuer_chain = ca_info;
+
+    // NOTE: Intentionally freeing cert that is not used anymore.
+    X509_free(*cert);
+
+    // Delete cert and continue aggregating issuers.
+    *cert = ca;
+  }
+  return issuer_chain;
+}
+
+
 template <class Base>
 void SSLWrap<Base>::GetPeerCertificate(
     const FunctionCallbackInfo<Value>& args) {
   Base* w;
   ASSIGN_OR_RETURN_UNWRAP(&w, args.Holder());
   Environment* env = w->ssl_env();
-  Local<Context> context = env->context();
 
   ClearErrorOnReturn clear_error_on_return;
 
   Local<Object> result;
-  Local<Object> info;
+  // Used to build the issuer certificate chain.
+  Local<Object> issuer_chain;
 
   // NOTE: This is because of the odd OpenSSL behavior. On client `cert_chain`
-  // contains the `peer_certificate`, but on server it doesn't
+  // contains the `peer_certificate`, but on server it doesn't.
   X509* cert = w->is_server() ? SSL_get_peer_certificate(w->ssl_) : nullptr;
   STACK_OF(X509)* ssl_certs = SSL_get_peer_cert_chain(w->ssl_);
-  STACK_OF(X509)* peer_certs = nullptr;
-  if (cert == nullptr && ssl_certs == nullptr)
+  if (cert == nullptr && (ssl_certs == nullptr || sk_X509_num(ssl_certs) == 0))
     goto done;
 
-  if (cert == nullptr && sk_X509_num(ssl_certs) == 0)
-    goto done;
-
-  // Short result requested
+  // Short result requested.
   if (args.Length() < 1 || !args[0]->IsTrue()) {
-    result = X509ToObject(env,
-                          cert == nullptr ? sk_X509_value(ssl_certs, 0) : cert);
+    X509* target_cert = cert;
+    if (target_cert == nullptr)
+      target_cert = sk_X509_value(ssl_certs, 0);
+    result = X509ToObject(env, target_cert);
     goto done;
   }
 
-  // Clone `ssl_certs`, because we are going to destruct it
-  peer_certs = sk_X509_new(nullptr);
-  if (cert != nullptr)
-    sk_X509_push(peer_certs, cert);
-  for (int i = 0; i < sk_X509_num(ssl_certs); i++) {
-    cert = X509_dup(sk_X509_value(ssl_certs, i));
-    if (cert == nullptr)
-      goto done;
-    if (!sk_X509_push(peer_certs, cert))
-      goto done;
+  if (auto peer_certs = CloneSSLCerts(&cert, ssl_certs)) {
+    // First and main certificate.
+    cert = sk_X509_value(peer_certs.get(), 0);
+    result = X509ToObject(env, cert);
+
+    issuer_chain =
+        AddIssuerChainToObject(&cert, result, std::move(peer_certs), env);
+    issuer_chain = GetLastIssuedCert(&cert, w->ssl_, issuer_chain, env);
+    // Last certificate should be self-signed.
+    if (X509_check_issued(cert, cert) == X509_V_OK)
+      issuer_chain->Set(env->context(),
+                        env->issuercert_string(),
+                        issuer_chain).FromJust();
+
+    CHECK_NE(cert, nullptr);
   }
-
-  // First and main certificate
-  cert = sk_X509_value(peer_certs, 0);
-  result = X509ToObject(env, cert);
-  info = result;
-
-  // Put issuer inside the object
-  cert = sk_X509_delete(peer_certs, 0);
-  while (sk_X509_num(peer_certs) > 0) {
-    int i;
-    for (i = 0; i < sk_X509_num(peer_certs); i++) {
-      X509* ca = sk_X509_value(peer_certs, i);
-      if (X509_check_issued(ca, cert) != X509_V_OK)
-        continue;
-
-      Local<Object> ca_info = X509ToObject(env, ca);
-      info->Set(context, env->issuercert_string(), ca_info).FromJust();
-      info = ca_info;
-
-      // NOTE: Intentionally freeing cert that is not used anymore
-      X509_free(cert);
-
-      // Delete cert and continue aggregating issuers
-      cert = sk_X509_delete(peer_certs, i);
-      break;
-    }
-
-    // Issuer not found, break out of the loop
-    if (i == sk_X509_num(peer_certs))
-      break;
-  }
-
-  // Last certificate should be self-signed
-  while (X509_check_issued(cert, cert) != X509_V_OK) {
-    X509* ca;
-    if (SSL_CTX_get_issuer(SSL_get_SSL_CTX(w->ssl_), cert, &ca) <= 0)
-      break;
-
-    Local<Object> ca_info = X509ToObject(env, ca);
-    info->Set(context, env->issuercert_string(), ca_info).FromJust();
-    info = ca_info;
-
-    // NOTE: Intentionally freeing cert that is not used anymore
-    X509_free(cert);
-
-    // Delete cert and continue aggregating issuers
-    cert = ca;
-  }
-
-  // Self-issued certificate
-  if (X509_check_issued(cert, cert) == X509_V_OK)
-    info->Set(context, env->issuercert_string(), info).FromJust();
-
-  CHECK_NE(cert, nullptr);
 
  done:
   if (cert != nullptr)
     X509_free(cert);
-  if (peer_certs != nullptr)
-    sk_X509_pop_free(peer_certs, X509_free);
   if (result.IsEmpty())
     result = Object::New(env->isolate());
   args.GetReturnValue().Set(result);
@@ -2772,7 +2813,6 @@ void SSLWrap<Base>::CertCbDone(const FunctionCallbackInfo<Value>& args) {
   if (cons->HasInstance(ctx)) {
     SecureContext* sc;
     ASSIGN_OR_RETURN_UNWRAP(&sc, ctx.As<Object>());
-    w->sni_context_.Reset();
     w->sni_context_.Reset(env->isolate(), ctx);
 
     int rv;
@@ -2914,25 +2954,23 @@ inline CheckResult CheckWhitelistedServerCert(X509_STORE_CTX* ctx) {
   unsigned char hash[CNNIC_WHITELIST_HASH_LEN];
   unsigned int hashlen = CNNIC_WHITELIST_HASH_LEN;
 
-  STACK_OF(X509)* chain = X509_STORE_CTX_get1_chain(ctx);
-  CHECK_NE(chain, nullptr);
-  CHECK_GT(sk_X509_num(chain), 0);
+  StackOfX509 chain(X509_STORE_CTX_get1_chain(ctx));
+  CHECK(chain);
+  CHECK_GT(sk_X509_num(chain.get()), 0);
 
   // Take the last cert as root at the first time.
-  X509* root_cert = sk_X509_value(chain, sk_X509_num(chain)-1);
+  X509* root_cert = sk_X509_value(chain.get(), sk_X509_num(chain.get())-1);
   X509_NAME* root_name = X509_get_subject_name(root_cert);
 
   if (!IsSelfSigned(root_cert)) {
-    root_cert = FindRoot(chain);
+    root_cert = FindRoot(chain.get());
     CHECK_NE(root_cert, nullptr);
     root_name = X509_get_subject_name(root_cert);
   }
 
-  X509* leaf_cert = sk_X509_value(chain, 0);
-  if (!CheckStartComOrWoSign(root_name, leaf_cert)) {
-    sk_X509_pop_free(chain, X509_free);
+  X509* leaf_cert = sk_X509_value(chain.get(), 0);
+  if (!CheckStartComOrWoSign(root_name, leaf_cert))
     return CHECK_CERT_REVOKED;
-  }
 
   // When the cert is issued from either CNNNIC ROOT CA or CNNNIC EV
   // ROOT CA, check a hash of its leaf cert if it is in the whitelist.
@@ -2945,13 +2983,10 @@ inline CheckResult CheckWhitelistedServerCert(X509_STORE_CTX* ctx) {
     void* result = bsearch(hash, WhitelistedCNNICHashes,
                            arraysize(WhitelistedCNNICHashes),
                            CNNIC_WHITELIST_HASH_LEN, compar);
-    if (result == nullptr) {
-      sk_X509_pop_free(chain, X509_free);
+    if (result == nullptr)
       return CHECK_CERT_REVOKED;
-    }
   }
 
-  sk_X509_pop_free(chain, X509_free);
   return CHECK_OK;
 }
 
@@ -3090,8 +3125,17 @@ void CipherBase::InitIv(const char* cipher_type,
   const int expected_iv_len = EVP_CIPHER_iv_length(cipher);
   const int mode = EVP_CIPHER_mode(cipher);
   const bool is_gcm_mode = (EVP_CIPH_GCM_MODE == mode);
+  const bool has_iv = iv_len >= 0;
 
-  if (is_gcm_mode == false && iv_len != expected_iv_len) {
+  // Throw if no IV was passed and the cipher requires an IV
+  if (!has_iv && expected_iv_len != 0) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Missing IV for cipher %s", cipher_type);
+    return env()->ThrowError(msg);
+  }
+
+  // Throw if an IV was passed which does not match the cipher's fixed IV length
+  if (is_gcm_mode == false && has_iv && iv_len != expected_iv_len) {
     return env()->ThrowError("Invalid IV length");
   }
 
@@ -3103,11 +3147,13 @@ void CipherBase::InitIv(const char* cipher_type,
   const bool encrypt = (kind_ == kCipher);
   EVP_CipherInit_ex(ctx_, cipher, nullptr, nullptr, nullptr, encrypt);
 
-  if (is_gcm_mode &&
-      !EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_GCM_SET_IVLEN, iv_len, nullptr)) {
-    EVP_CIPHER_CTX_free(ctx_);
-    ctx_ = nullptr;
-    return env()->ThrowError("Invalid IV length");
+  if (is_gcm_mode) {
+    CHECK(has_iv);
+    if (!EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_GCM_SET_IVLEN, iv_len, nullptr)) {
+      EVP_CIPHER_CTX_free(ctx_);
+      ctx_ = nullptr;
+      return env()->ThrowError("Invalid IV length");
+    }
   }
 
   if (!EVP_CIPHER_CTX_set_key_length(ctx_, key_len)) {
@@ -3135,8 +3181,15 @@ void CipherBase::InitIv(const FunctionCallbackInfo<Value>& args) {
   const node::Utf8Value cipher_type(env->isolate(), args[0]);
   ssize_t key_len = Buffer::Length(args[1]);
   const char* key_buf = Buffer::Data(args[1]);
-  ssize_t iv_len = Buffer::Length(args[2]);
-  const char* iv_buf = Buffer::Data(args[2]);
+  ssize_t iv_len;
+  const char* iv_buf;
+  if (args[2]->IsNull()) {
+    iv_buf = nullptr;
+    iv_len = -1;
+  } else {
+    iv_buf = Buffer::Data(args[2]);
+    iv_len = Buffer::Length(args[2]);
+  }
   cipher->InitIv(*cipher_type, key_buf, key_len, iv_buf, iv_len);
 }
 
@@ -4895,7 +4948,6 @@ class PBKDF2Request : public AsyncWrap {
     keylen_ = 0;
 
     ClearWrap(object());
-    persistent().Reset();
   }
 
   uv_work_t* work_req() {
@@ -4943,7 +4995,7 @@ void PBKDF2Request::Work(uv_work_t* work_req) {
 
 void PBKDF2Request::After(Local<Value> (*argv)[2]) {
   if (success_) {
-    (*argv)[0] = Undefined(env()->isolate());
+    (*argv)[0] = Null(env()->isolate());
     (*argv)[1] = Buffer::New(env(), key_, keylen_).ToLocalChecked();
     key_ = nullptr;
     keylen_ = 0;
@@ -5062,7 +5114,6 @@ class RandomBytesRequest : public AsyncWrap {
 
   ~RandomBytesRequest() override {
     ClearWrap(object());
-    persistent().Reset();
   }
 
   uv_work_t* work_req() {

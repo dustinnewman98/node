@@ -55,9 +55,9 @@ The API has proven satisfactory. Compatibility with the npm ecosystem
 is a high priority, and will not be broken unless absolutely necessary.
 ```
 
-*Note*: Caution must be used when making use of `Experimental` features,
-particularly within modules that may be used as dependencies (or dependencies
-of dependencies) within a Node.js application. End users may not be aware that
+Caution must be used when making use of `Experimental` features, particularly
+within modules that may be used as dependencies (or dependencies of
+dependencies) within a Node.js application. End users may not be aware that
 experimental features are being used, and therefore may experience unexpected
 failures or behavior changes when API modifications occur. To help avoid such
 surprises, `Experimental` features may require a command-line flag to
@@ -80,13 +80,14 @@ wish to do programmatic things with the documentation.
 ## Syscalls and man pages
 
 System calls like open(2) and read(2) define the interface between user programs
-and the underlying operating system. Node functions which simply wrap a syscall,
+and the underlying operating system. Node.js functions
+which simply wrap a syscall,
 like [`fs.open()`][], will document that. The docs link to the corresponding man
 pages (short for manual pages) which describe how the syscalls work.
 
 Some syscalls, like lchown(2), are BSD-specific. That means, for
-example, that [`fs.lchown()`][] only works on macOS and other BSD-derived systems,
-and is not available on Linux.
+example, that [`fs.lchown()`][] only works on macOS and other BSD-derived
+systems, and is not available on Linux.
 
 Most Unix syscalls have Windows equivalents, but behavior may differ on Windows
 relative to Linux and macOS. For an example of the subtle ways in which it's

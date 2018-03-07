@@ -3,6 +3,7 @@
 const common = require('../common');
 const assert = require('assert');
 const fs = require('fs');
+const fsPromises = require('fs/promises');
 const net = require('net');
 const providers = Object.assign({}, process.binding('async_wrap').Providers);
 const fixtures = require('../common/fixtures');
@@ -25,16 +26,20 @@ common.crashOnUnhandledRejection();
     hooks.disable();
     delete providers.NONE;  // Should never be used.
 
+    // See test/pseudo-tty/test-async-wrap-getasyncid-tty.js
+    // Requires an 'actual' tty fd to be available.
+    delete providers.TTYWRAP;
+
     // TODO(jasnell): Test for these
     delete providers.HTTP2SESSION;
     delete providers.HTTP2STREAM;
     delete providers.HTTP2PING;
     delete providers.HTTP2SETTINGS;
 
-    const obj_keys = Object.keys(providers);
-    if (obj_keys.length > 0)
-      process._rawDebug(obj_keys);
-    assert.strictEqual(obj_keys.length, 0);
+    const objKeys = Object.keys(providers);
+    if (objKeys.length > 0)
+      process._rawDebug(objKeys);
+    assert.strictEqual(objKeys.length, 0);
   }));
 }
 
@@ -91,7 +96,7 @@ function testInitialized(req, ctor_name) {
 }
 
 
-if (common.hasCrypto) { // eslint-disable-line crypto-check
+if (common.hasCrypto) { // eslint-disable-line node-core/crypto-check
   const crypto = require('crypto');
 
   // The handle for PBKDF2 and RandomBytes isn't returned by the function call,
@@ -171,7 +176,7 @@ if (common.hasCrypto) { // eslint-disable-line crypto-check
 
 {
   async function openTest() {
-    const fd = await fs.promises.open(__filename, 'r');
+    const fd = await fsPromises.open(__filename, 'r');
     testInitialized(fd, 'FileHandle');
     await fd.close();
   }
@@ -197,7 +202,6 @@ if (common.hasCrypto) { // eslint-disable-line crypto-check
     const handle = new tcp_wrap.TCP(tcp_wrap.constants.SOCKET);
     const req = new tcp_wrap.TCPConnectWrap();
     const sreq = new stream_wrap.ShutdownWrap();
-    const wreq = new stream_wrap.WriteWrap();
     testInitialized(handle, 'TCP');
     testUninitialized(req, 'TCPConnectWrap');
     testUninitialized(sreq, 'ShutdownWrap');
@@ -206,20 +210,25 @@ if (common.hasCrypto) { // eslint-disable-line crypto-check
       handle.close();
     });
 
-    wreq.handle = handle;
-    wreq.oncomplete = common.mustCall(() => {
-      handle.shutdown(sreq);
-      testInitialized(sreq, 'ShutdownWrap');
-    });
-    wreq.async = true;
-
-    req.oncomplete = common.mustCall(() => {
-      // Use a long string to make sure the write happens asynchronously.
+    req.oncomplete = common.mustCall(writeData);
+    function writeData() {
+      const wreq = new stream_wrap.WriteWrap();
+      wreq.handle = handle;
+      wreq.oncomplete = () => {
+        handle.shutdown(sreq);
+        testInitialized(sreq, 'ShutdownWrap');
+      };
       const err = handle.writeLatin1String(wreq, 'hi'.repeat(100000));
       if (err)
         throw new Error(`write failed: ${getSystemErrorName(err)}`);
+      if (!wreq.async) {
+        testUninitialized(wreq, 'WriteWrap');
+        // Synchronous finish. Write more data until we hit an
+        // asynchronous write.
+        return writeData();
+      }
       testInitialized(wreq, 'WriteWrap');
-    });
+    }
     req.address = common.localhostIPv4;
     req.port = server.address().port;
     const err = handle.connect(req, req.address, req.port);
@@ -235,7 +244,7 @@ if (common.hasCrypto) { // eslint-disable-line crypto-check
 }
 
 
-if (common.hasCrypto) { // eslint-disable-line crypto-check
+if (common.hasCrypto) { // eslint-disable-line node-core/crypto-check
   const { TCP, constants: TCPConstants } = process.binding('tcp_wrap');
   const tcp = new TCP(TCPConstants.SOCKET);
 
@@ -251,44 +260,6 @@ if (common.hasCrypto) { // eslint-disable-line crypto-check
     tls_wrap.wrap(tcp._externalStream, credentials.context, true), 'TLSWrap');
 }
 
-
-{
-  // Do our best to grab a tty fd.
-  function getTTYfd() {
-    const tty = require('tty');
-    let ttyFd = [0, 1, 2].find(tty.isatty);
-    if (ttyFd === undefined) {
-      try {
-        ttyFd = fs.openSync('/dev/tty');
-      } catch (e) {
-        // There aren't any tty fd's available to use.
-        return -1;
-      }
-    }
-    return ttyFd;
-  }
-
-  const ttyFd = getTTYfd();
-  if (ttyFd >= 0) {
-    const tty_wrap = process.binding('tty_wrap');
-    // fd may still be invalid, so guard against it.
-    const handle = (() => {
-      try {
-        return new tty_wrap.TTY(ttyFd, false);
-      } catch (e) {
-        return null;
-      }
-    })();
-    if (handle !== null)
-      testInitialized(handle, 'TTY');
-    else
-      delete providers.TTYWRAP;
-  } else {
-    delete providers.TTYWRAP;
-  }
-}
-
-
 {
   const binding = process.binding('udp_wrap');
   const handle = new binding.UDP();
@@ -296,9 +267,11 @@ if (common.hasCrypto) { // eslint-disable-line crypto-check
   testInitialized(handle, 'UDP');
   testUninitialized(req, 'SendWrap');
 
-  handle.bind('0.0.0.0', common.PORT, undefined);
+  handle.bind('0.0.0.0', 0, undefined);
+  const addr = {};
+  handle.getsockname(addr);
   req.address = '127.0.0.1';
-  req.port = common.PORT;
+  req.port = addr.port;
   req.oncomplete = () => handle.close();
   handle.send(req, [Buffer.alloc(1)], 1, req.port, req.address, true);
   testInitialized(req, 'SendWrap');

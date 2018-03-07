@@ -5,6 +5,7 @@ const common = require('../common');
 common.skipIfInspectorDisabled();
 
 const assert = require('assert');
+const { resolve: UrlResolve } = require('url');
 const fixtures = require('../common/fixtures');
 const { NodeInstance } = require('../common/inspector-helper.js');
 
@@ -17,9 +18,9 @@ function assertNoUrlsWhileConnected(response) {
 function assertScopeValues({ result }, expected) {
   const unmatched = new Set(Object.keys(expected));
   for (const actual of result) {
-    const value = expected[actual['name']];
-    assert.strictEqual(actual['value']['value'], value);
-    unmatched.delete(actual['name']);
+    const value = expected[actual.name];
+    assert.strictEqual(actual.value.value, value);
+    unmatched.delete(actual.name);
   }
   assert.deepStrictEqual(Array.from(unmatched.values()), []);
 }
@@ -43,14 +44,15 @@ async function testBreakpointOnStart(session) {
   ];
 
   await session.send(commands);
-  await session.waitForBreakOnLine(0, session.scriptURL());
+  await session.waitForBreakOnLine(
+    0, UrlResolve(session.scriptURL().toString(), 'message.mjs'));
 }
 
 async function testBreakpoint(session) {
   console.log('[test]', 'Setting a breakpoint and verifying it is hit');
   const commands = [
     { 'method': 'Debugger.setBreakpointByUrl',
-      'params': { 'lineNumber': 5,
+      'params': { 'lineNumber': 7,
                   'url': session.scriptURL(),
                   'columnNumber': 0,
                   'condition': ''
@@ -66,7 +68,7 @@ async function testBreakpoint(session) {
          `Script source is wrong: ${scriptSource}`);
 
   await session.waitForConsoleOutput('log', ['A message', 5]);
-  const paused = await session.waitForBreakOnLine(5, session.scriptURL());
+  const paused = await session.waitForBreakOnLine(7, session.scriptURL());
   const scopeId = paused.params.callFrames[0].scopeChain[0].object.objectId;
 
   console.log('[test]', 'Verify we can read current application state');
@@ -79,7 +81,7 @@ async function testBreakpoint(session) {
       'generatePreview': true
     }
   });
-  assertScopeValues(response, { t: 1001, k: 1 });
+  assertScopeValues(response, { t: 1001, k: 1, message: 'A message' });
 
   let { result } = await session.send({
     'method': 'Debugger.evaluateOnCallFrame', 'params': {
@@ -93,14 +95,14 @@ async function testBreakpoint(session) {
     }
   });
 
-  assert.strictEqual(result['value'], 1002);
+  assert.strictEqual(result.value, 1002);
 
   result = (await session.send({
     'method': 'Runtime.evaluate', 'params': {
       'expression': '5 * 5'
     }
   })).result;
-  assert.strictEqual(result['value'], 25);
+  assert.strictEqual(result.value, 25);
 }
 
 async function runTest() {

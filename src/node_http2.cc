@@ -278,8 +278,6 @@ Http2Session::Http2Settings::Http2Settings(
 Http2Session::Http2Settings::~Http2Settings() {
   if (!object().IsEmpty())
     ClearWrap(object());
-  persistent().Reset();
-  CHECK(persistent().IsEmpty());
 }
 
 // Generates a Buffer that contains the serialized payload of a SETTINGS
@@ -533,10 +531,6 @@ Http2Session::Http2Session(Environment* env,
 
 Http2Session::~Http2Session() {
   CHECK_EQ(flags_ & SESSION_STATE_HAS_SCOPE, 0);
-  if (!object().IsEmpty())
-    ClearWrap(object());
-  persistent().Reset();
-  CHECK(persistent().IsEmpty());
   DEBUG_HTTP2SESSION(this, "freeing nghttp2 session");
   nghttp2_session_del(session_);
 }
@@ -764,13 +758,7 @@ inline ssize_t Http2Session::Write(const uv_buf_t* bufs, size_t nbufs) {
                                bufs[n].len);
     CHECK_NE(ret, NGHTTP2_ERR_NOMEM);
 
-    // If there is an error calling any of the callbacks, ret will be a
-    // negative number identifying the error code. This can happen, for
-    // instance, if the session is destroyed during any of the JS callbacks
-    // Note: if ssize_t is not defined (e.g. on Win32), nghttp2 will typedef
-    // ssize_t to int. Cast here so that the < 0 check actually works on
-    // Windows.
-    if (static_cast<int>(ret) < 0)
+    if (ret < 0)
       return ret;
 
     total += ret;
@@ -1558,18 +1546,9 @@ void Http2Session::SendPendingData() {
 
   chunks_sent_since_last_write_++;
 
-  // DoTryWrite may modify both the buffer list start itself and the
-  // base pointers/length of the individual buffers.
-  uv_buf_t* writebufs = *bufs;
-  if (stream_->DoTryWrite(&writebufs, &count) != 0 || count == 0) {
-    // All writes finished synchronously, nothing more to do here.
-    ClearOutgoing(0);
-    return;
-  }
-
-  WriteWrap* req = AllocateSend();
-  if (stream_->DoWrite(req, writebufs, count, nullptr) != 0) {
-    req->Dispose();
+  StreamWriteResult res = underlying_stream()->Write(*bufs, count);
+  if (!res.async) {
+    ClearOutgoing(res.err);
   }
 
   DEBUG_HTTP2SESSION2(this, "wants data in return? %d",
@@ -1655,15 +1634,6 @@ inline void Http2Session::SetChunksSinceLastWrite(size_t n) {
   chunks_sent_since_last_write_ = n;
 }
 
-// Allocates the data buffer used to pass outbound data to the i/o stream.
-WriteWrap* Http2Session::AllocateSend() {
-  HandleScope scope(env()->isolate());
-  Local<Object> obj =
-      env()->write_wrap_constructor_function()
-          ->NewInstance(env()->context()).ToLocalChecked();
-  return WriteWrap::New(env(), obj, static_cast<StreamBase*>(stream_));
-}
-
 // Callback used to receive inbound data from the i/o stream
 void Http2Session::OnStreamRead(ssize_t nread, const uv_buf_t& buf) {
   Http2Scope h2scope(this);
@@ -1709,10 +1679,7 @@ void Http2Session::OnStreamRead(ssize_t nread, const uv_buf_t& buf) {
     statistics_.data_received += nread;
     ssize_t ret = Write(&stream_buf_, 1);
 
-    // Note: if ssize_t is not defined (e.g. on Win32), nghttp2 will typedef
-    // ssize_t to int. Cast here so that the < 0 check actually works on
-    // Windows.
-    if (static_cast<int>(ret) < 0) {
+    if (ret < 0) {
       DEBUG_HTTP2SESSION2(this, "fatal error receiving data: %d", ret);
 
       Local<Value> argv[] = {
@@ -1731,6 +1698,14 @@ void Http2Session::OnStreamRead(ssize_t nread, const uv_buf_t& buf) {
 
   stream_buf_ab_ = Local<ArrayBuffer>();
   stream_buf_ = uv_buf_init(nullptr, 0);
+}
+
+bool Http2Session::HasWritesOnSocketForStream(Http2Stream* stream) {
+  for (const nghttp2_stream_write& wr : outgoing_buffers_) {
+    if (wr.req_wrap != nullptr && wr.req_wrap->stream() == stream)
+      return true;
+  }
+  return false;
 }
 
 // Every Http2Session session is tightly bound to a single i/o StreamBase
@@ -1786,15 +1761,11 @@ Http2Stream::Http2Stream(
 
 
 Http2Stream::~Http2Stream() {
+  DEBUG_HTTP2STREAM(this, "tearing down stream");
   if (session_ != nullptr) {
     session_->RemoveStream(this);
     session_ = nullptr;
   }
-
-  if (!object().IsEmpty())
-    ClearWrap(object());
-  persistent().Reset();
-  CHECK(persistent().IsEmpty());
 }
 
 // Notify the Http2Stream that a new block of HEADERS is being processed.
@@ -1842,20 +1813,15 @@ inline void Http2Stream::Close(int32_t code) {
   DEBUG_HTTP2STREAM2(this, "closed with code %d", code);
 }
 
-
-inline void Http2Stream::Shutdown() {
-  CHECK(!this->IsDestroyed());
-  Http2Scope h2scope(this);
-  flags_ |= NGHTTP2_STREAM_FLAG_SHUT;
-  CHECK_NE(nghttp2_session_resume_data(session_->session(), id_),
-           NGHTTP2_ERR_NOMEM);
-  DEBUG_HTTP2STREAM(this, "writable side shutdown");
-}
-
 int Http2Stream::DoShutdown(ShutdownWrap* req_wrap) {
   CHECK(!this->IsDestroyed());
-  req_wrap->Dispatched();
-  Shutdown();
+  {
+    Http2Scope h2scope(this);
+    flags_ |= NGHTTP2_STREAM_FLAG_SHUT;
+    CHECK_NE(nghttp2_session_resume_data(session_->session(), id_),
+             NGHTTP2_ERR_NOMEM);
+    DEBUG_HTTP2STREAM(this, "writable side shutdown");
+  }
   req_wrap->Done(0);
   return 0;
 }
@@ -1877,7 +1843,7 @@ inline void Http2Stream::Destroy() {
     Http2Stream* stream = static_cast<Http2Stream*>(data);
     // Free any remaining outgoing data chunks here. This should be done
     // here because it's possible for destroy to have been called while
-    // we still have qeueued outbound writes.
+    // we still have queued outbound writes.
     while (!stream->queue_.empty()) {
       nghttp2_stream_write& head = stream->queue_.front();
       if (head.req_wrap != nullptr)
@@ -1885,7 +1851,11 @@ inline void Http2Stream::Destroy() {
       stream->queue_.pop();
     }
 
-    delete stream;
+    // We can destroy the stream now if there are no writes for it
+    // already on the socket. Otherwise, we'll wait for the garbage collector
+    // to take care of cleaning up.
+    if (!stream->session()->HasWritesOnSocketForStream(stream))
+      delete stream;
   }, this, this->object());
 
   statistics_.end_time = uv_hrtime();
@@ -2047,7 +2017,6 @@ inline int Http2Stream::DoWrite(WriteWrap* req_wrap,
   CHECK_EQ(send_handle, nullptr);
   Http2Scope h2scope(this);
   session_->SetChunksSinceLastWrite();
-  req_wrap->Dispatched();
   if (!IsWritable()) {
     req_wrap->Done(UV_EOF);
     return 0;
@@ -2225,6 +2194,17 @@ ssize_t Http2Stream::Provider::Stream::OnRead(nghttp2_session* handle,
 
   size_t amount = 0;          // amount of data being sent in this data frame.
 
+  // Remove all empty chunks from the head of the queue.
+  // This is done here so that .write('', cb) is still a meaningful way to
+  // find out when the HTTP2 stream wants to consume data, and because the
+  // StreamBase API allows empty input chunks.
+  while (!stream->queue_.empty() && stream->queue_.front().buf.len == 0) {
+    WriteWrap* finished = stream->queue_.front().req_wrap;
+    stream->queue_.pop();
+    if (finished != nullptr)
+      finished->Done(0);
+  }
+
   if (!stream->queue_.empty()) {
     DEBUG_HTTP2SESSION2(session, "stream %d has pending outbound data", id);
     amount = std::min(stream->available_outbound_length_, length);
@@ -2238,7 +2218,8 @@ ssize_t Http2Stream::Provider::Stream::OnRead(nghttp2_session* handle,
     }
   }
 
-  if (amount == 0 && stream->IsWritable() && stream->queue_.empty()) {
+  if (amount == 0 && stream->IsWritable()) {
+    CHECK(stream->queue_.empty());
     DEBUG_HTTP2SESSION2(session, "deferring stream %d", id);
     return NGHTTP2_ERR_DEFERRED;
   }
@@ -2805,8 +2786,6 @@ Http2Session::Http2Ping::Http2Ping(
 Http2Session::Http2Ping::~Http2Ping() {
   if (!object().IsEmpty())
     ClearWrap(object());
-  persistent().Reset();
-  CHECK(persistent().IsEmpty());
 }
 
 void Http2Session::Http2Ping::Send(uint8_t* payload) {
@@ -2950,29 +2929,39 @@ void Initialize(Local<Object> target,
               session->GetFunction()).FromJust();
 
   Local<Object> constants = Object::New(isolate);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_SESSION_SERVER);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_SESSION_CLIENT);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_STATE_IDLE);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_STATE_OPEN);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_STATE_RESERVED_LOCAL);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_STATE_RESERVED_REMOTE);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_STATE_CLOSED);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_NO_ERROR);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_PROTOCOL_ERROR);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_INTERNAL_ERROR);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_FLOW_CONTROL_ERROR);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_SETTINGS_TIMEOUT);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_STREAM_CLOSED);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_FRAME_SIZE_ERROR);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_REFUSED_STREAM);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_CANCEL);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_COMPRESSION_ERROR);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_CONNECT_ERROR);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_ENHANCE_YOUR_CALM);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_INADEQUATE_SECURITY);
-  NODE_DEFINE_CONSTANT(constants, NGHTTP2_HTTP_1_1_REQUIRED);
+  Local<Array> name_for_error_code = Array::New(isolate);
+
+#define NODE_NGHTTP2_ERROR_CODES(V)                       \
+  V(NGHTTP2_SESSION_SERVER);                              \
+  V(NGHTTP2_SESSION_CLIENT);                              \
+  V(NGHTTP2_STREAM_STATE_IDLE);                           \
+  V(NGHTTP2_STREAM_STATE_OPEN);                           \
+  V(NGHTTP2_STREAM_STATE_RESERVED_LOCAL);                 \
+  V(NGHTTP2_STREAM_STATE_RESERVED_REMOTE);                \
+  V(NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL);              \
+  V(NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE);             \
+  V(NGHTTP2_STREAM_STATE_CLOSED);                         \
+  V(NGHTTP2_NO_ERROR);                                    \
+  V(NGHTTP2_PROTOCOL_ERROR);                              \
+  V(NGHTTP2_INTERNAL_ERROR);                              \
+  V(NGHTTP2_FLOW_CONTROL_ERROR);                          \
+  V(NGHTTP2_SETTINGS_TIMEOUT);                            \
+  V(NGHTTP2_STREAM_CLOSED);                               \
+  V(NGHTTP2_FRAME_SIZE_ERROR);                            \
+  V(NGHTTP2_REFUSED_STREAM);                              \
+  V(NGHTTP2_CANCEL);                                      \
+  V(NGHTTP2_COMPRESSION_ERROR);                           \
+  V(NGHTTP2_CONNECT_ERROR);                               \
+  V(NGHTTP2_ENHANCE_YOUR_CALM);                           \
+  V(NGHTTP2_INADEQUATE_SECURITY);                         \
+  V(NGHTTP2_HTTP_1_1_REQUIRED);                           \
+
+#define V(name)                                                         \
+  NODE_DEFINE_CONSTANT(constants, name);                                \
+  name_for_error_code->Set(static_cast<int>(name),                      \
+                           FIXED_ONE_BYTE_STRING(isolate, #name));
+  NODE_NGHTTP2_ERROR_CODES(V)
+#undef V
 
   NODE_DEFINE_HIDDEN_CONSTANT(constants, NGHTTP2_HCAT_REQUEST);
   NODE_DEFINE_HIDDEN_CONSTANT(constants, NGHTTP2_HCAT_RESPONSE);
@@ -3037,6 +3026,9 @@ HTTP_STATUS_CODES(V)
   target->Set(context,
               FIXED_ONE_BYTE_STRING(isolate, "constants"),
               constants).FromJust();
+  target->Set(context,
+              FIXED_ONE_BYTE_STRING(isolate, "nameForErrorCode"),
+              name_for_error_code).FromJust();
 }
 }  // namespace http2
 }  // namespace node

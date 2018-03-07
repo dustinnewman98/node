@@ -25,10 +25,12 @@ const fixtures = require('../common/fixtures');
 const assert = require('assert');
 const fs = require('fs');
 const nonexistentFile = fixtures.path('non-existent');
+const nonexistentDir = fixtures.path('non-existent', 'foo', 'bar');
 const existingFile = fixtures.path('exit.js');
 const existingFile2 = fixtures.path('create-file.js');
 const existingDir = fixtures.path('empty');
 const existingDir2 = fixtures.path('keys');
+const { COPYFILE_EXCL } = fs.constants;
 const uv = process.binding('uv');
 
 // Template tag function for escaping special characters in strings so that:
@@ -94,15 +96,14 @@ function re(literals, ...values) {
     return true;
   };
 
-  const fd = fs.openSync(existingFile, 'r');
-  fs.closeSync(fd);
+  common.runWithInvalidFD((fd) => {
+    fs.fstat(fd, common.mustCall(validateError));
 
-  fs.fstat(fd, common.mustCall(validateError));
-
-  assert.throws(
-    () => fs.fstatSync(fd),
-    validateError
-  );
+    assert.throws(
+      () => fs.fstatSync(fd),
+      validateError
+    );
+  });
 }
 
 // realpath
@@ -122,6 +123,27 @@ function re(literals, ...values) {
 
   assert.throws(
     () => fs.realpathSync(nonexistentFile),
+    validateError
+  );
+}
+
+// native realpath
+{
+  const validateError = (err) => {
+    assert.strictEqual(nonexistentFile, err.path);
+    assert.strictEqual(
+      err.message,
+      `ENOENT: no such file or directory, realpath '${nonexistentFile}'`);
+    assert.strictEqual(err.errno, uv.UV_ENOENT);
+    assert.strictEqual(err.code, 'ENOENT');
+    assert.strictEqual(err.syscall, 'realpath');
+    return true;
+  };
+
+  fs.realpath.native(nonexistentFile, common.mustCall(validateError));
+
+  assert.throws(
+    () => fs.realpathSync.native(nonexistentFile),
     validateError
   );
 }
@@ -414,6 +436,27 @@ function re(literals, ...values) {
   );
 }
 
+
+// close
+{
+  const validateError = (err) => {
+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, close');
+    assert.strictEqual(err.errno, uv.UV_EBADF);
+    assert.strictEqual(err.code, 'EBADF');
+    assert.strictEqual(err.syscall, 'close');
+    return true;
+  };
+
+  common.runWithInvalidFD((fd) => {
+    fs.close(fd, common.mustCall(validateError));
+
+    assert.throws(
+      () => fs.closeSync(fd),
+      validateError
+    );
+  });
+}
+
 // readFile
 {
   const validateError = (err) => {
@@ -472,15 +515,14 @@ function re(literals, ...values) {
     return true;
   };
 
-  const fd = fs.openSync(existingFile, 'r');
-  fs.closeSync(fd);
+  common.runWithInvalidFD((fd) => {
+    fs.ftruncate(fd, 4, common.mustCall(validateError));
 
-  fs.ftruncate(fd, 4, common.mustCall(validateError));
-
-  assert.throws(
-    () => fs.ftruncateSync(fd, 4),
-    validateError
-  );
+    assert.throws(
+      () => fs.ftruncateSync(fd, 4),
+      validateError
+    );
+  });
 }
 
 // fdatasync
@@ -493,15 +535,14 @@ function re(literals, ...values) {
     return true;
   };
 
-  const fd = fs.openSync(existingFile, 'r');
-  fs.closeSync(fd);
+  common.runWithInvalidFD((fd) => {
+    fs.fdatasync(fd, common.mustCall(validateError));
 
-  fs.fdatasync(fd, common.mustCall(validateError));
-
-  assert.throws(
-    () => fs.fdatasyncSync(fd),
-    validateError
-  );
+    assert.throws(
+      () => fs.fdatasyncSync(fd),
+      validateError
+    );
+  });
 }
 
 // fsync
@@ -514,13 +555,280 @@ function re(literals, ...values) {
     return true;
   };
 
-  const fd = fs.openSync(existingFile, 'r');
-  fs.closeSync(fd);
+  common.runWithInvalidFD((fd) => {
+    fs.fsync(fd, common.mustCall(validateError));
 
-  fs.fsync(fd, common.mustCall(validateError));
+    assert.throws(
+      () => fs.fsyncSync(fd),
+      validateError
+    );
+  });
+}
+
+// chown
+if (!common.isWindows) {
+  const validateError = (err) => {
+    assert.strictEqual(nonexistentFile, err.path);
+    assert.strictEqual(
+      err.message,
+      `ENOENT: no such file or directory, chown '${nonexistentFile}'`);
+    assert.strictEqual(err.errno, uv.UV_ENOENT);
+    assert.strictEqual(err.code, 'ENOENT');
+    assert.strictEqual(err.syscall, 'chown');
+    return true;
+  };
+
+  fs.chown(nonexistentFile, process.getuid(), process.getgid(),
+           common.mustCall(validateError));
 
   assert.throws(
-    () => fs.fsyncSync(fd),
+    () => fs.chownSync(nonexistentFile,
+                       process.getuid(), process.getgid()),
     validateError
   );
+}
+
+// utimes
+if (!common.isAIX) {
+  const validateError = (err) => {
+    assert.strictEqual(nonexistentFile, err.path);
+    assert.strictEqual(
+      err.message,
+      `ENOENT: no such file or directory, utime '${nonexistentFile}'`);
+    assert.strictEqual(err.errno, uv.UV_ENOENT);
+    assert.strictEqual(err.code, 'ENOENT');
+    assert.strictEqual(err.syscall, 'utime');
+    return true;
+  };
+
+  fs.utimes(nonexistentFile, new Date(), new Date(),
+            common.mustCall(validateError));
+
+  assert.throws(
+    () => fs.utimesSync(nonexistentFile, new Date(), new Date()),
+    validateError
+  );
+}
+
+// mkdtemp
+{
+  const validateError = (err) => {
+    const pathPrefix = new RegExp('^' + re`${nonexistentDir}`);
+    assert(pathPrefix.test(err.path),
+           `Expect ${err.path} to match ${pathPrefix}`);
+
+    const prefix = new RegExp('^ENOENT: no such file or directory, mkdtemp ' +
+                              re`'${nonexistentDir}`);
+    assert(prefix.test(err.message),
+           `Expect ${err.message} to match ${prefix}`);
+
+    assert.strictEqual(err.errno, uv.UV_ENOENT);
+    assert.strictEqual(err.code, 'ENOENT');
+    assert.strictEqual(err.syscall, 'mkdtemp');
+    return true;
+  };
+
+  fs.mkdtemp(nonexistentDir, common.mustCall(validateError));
+
+  assert.throws(
+    () => fs.mkdtempSync(nonexistentDir),
+    validateError
+  );
+}
+
+// copyFile with invalid flags
+{
+  const validateError = (err) => {
+    assert.strictEqual(err.message,
+                       'EINVAL: invalid argument, copyfile ' +
+                       `'${existingFile}' -> '${nonexistentFile}'`);
+    assert.strictEqual(err.errno, uv.UV_EINVAL);
+    assert.strictEqual(err.code, 'EINVAL');
+    assert.strictEqual(err.syscall, 'copyfile');
+    return true;
+  };
+
+  // TODO(joyeecheung): test fs.copyFile() when uv_fs_copyfile does not
+  // keep the loop open when the flags are invalid.
+  // See https://github.com/libuv/libuv/pull/1747
+
+  assert.throws(
+    () => fs.copyFileSync(existingFile, nonexistentFile, -1),
+    validateError
+  );
+}
+
+// copyFile: destination exists but the COPYFILE_EXCL flag is provided.
+{
+  const validateError = (err) => {
+    if (err.code === 'ENOENT') {  // Could be ENOENT or EEXIST
+      assert.strictEqual(err.message,
+                         'ENOENT: no such file or directory, copyfile ' +
+                         `'${existingFile}' -> '${existingFile2}'`);
+      assert.strictEqual(err.errno, uv.UV_ENOENT);
+      assert.strictEqual(err.code, 'ENOENT');
+      assert.strictEqual(err.syscall, 'copyfile');
+    } else {
+      assert.strictEqual(err.message,
+                         'EEXIST: file already exists, copyfile ' +
+                         `'${existingFile}' -> '${existingFile2}'`);
+      assert.strictEqual(err.errno, uv.UV_EEXIST);
+      assert.strictEqual(err.code, 'EEXIST');
+      assert.strictEqual(err.syscall, 'copyfile');
+    }
+    return true;
+  };
+
+  fs.copyFile(existingFile, existingFile2, COPYFILE_EXCL,
+              common.mustCall(validateError));
+
+  assert.throws(
+    () => fs.copyFileSync(existingFile, existingFile2, COPYFILE_EXCL),
+    validateError
+  );
+}
+
+// copyFile: the source does not exist.
+{
+  const validateError = (err) => {
+    assert.strictEqual(err.message,
+                       'ENOENT: no such file or directory, copyfile ' +
+                       `'${nonexistentFile}' -> '${existingFile2}'`);
+    assert.strictEqual(err.errno, uv.UV_ENOENT);
+    assert.strictEqual(err.code, 'ENOENT');
+    assert.strictEqual(err.syscall, 'copyfile');
+    return true;
+  };
+
+  fs.copyFile(nonexistentFile, existingFile2, COPYFILE_EXCL,
+              common.mustCall(validateError));
+
+  assert.throws(
+    () => fs.copyFileSync(nonexistentFile, existingFile2, COPYFILE_EXCL),
+    validateError
+  );
+}
+
+// read
+{
+  const validateError = (err) => {
+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, read');
+    assert.strictEqual(err.errno, uv.UV_EBADF);
+    assert.strictEqual(err.code, 'EBADF');
+    assert.strictEqual(err.syscall, 'read');
+    return true;
+  };
+
+  common.runWithInvalidFD((fd) => {
+    const buf = Buffer.alloc(5);
+    fs.read(fd, buf, 0, 1, 1, common.mustCall(validateError));
+
+    assert.throws(
+      () => fs.readSync(fd, buf, 0, 1, 1),
+      validateError
+    );
+  });
+}
+
+// fchmod
+{
+  const validateError = (err) => {
+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, fchmod');
+    assert.strictEqual(err.errno, uv.UV_EBADF);
+    assert.strictEqual(err.code, 'EBADF');
+    assert.strictEqual(err.syscall, 'fchmod');
+    return true;
+  };
+
+  common.runWithInvalidFD((fd) => {
+    fs.fchmod(fd, 0o666, common.mustCall(validateError));
+
+    assert.throws(
+      () => fs.fchmodSync(fd, 0o666),
+      validateError
+    );
+  });
+}
+
+// fchown
+if (!common.isWindows) {
+  const validateError = (err) => {
+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, fchown');
+    assert.strictEqual(err.errno, uv.UV_EBADF);
+    assert.strictEqual(err.code, 'EBADF');
+    assert.strictEqual(err.syscall, 'fchown');
+    return true;
+  };
+
+  common.runWithInvalidFD((fd) => {
+    fs.fchown(fd, process.getuid(), process.getgid(),
+              common.mustCall(validateError));
+
+    assert.throws(
+      () => fs.fchownSync(fd, process.getuid(), process.getgid()),
+      validateError
+    );
+  });
+}
+
+// write buffer
+{
+  const validateError = (err) => {
+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, write');
+    assert.strictEqual(err.errno, uv.UV_EBADF);
+    assert.strictEqual(err.code, 'EBADF');
+    assert.strictEqual(err.syscall, 'write');
+    return true;
+  };
+
+  common.runWithInvalidFD((fd) => {
+    const buf = Buffer.alloc(5);
+    fs.write(fd, buf, 0, 1, 1, common.mustCall(validateError));
+
+    assert.throws(
+      () => fs.writeSync(fd, buf, 0, 1, 1),
+      validateError
+    );
+  });
+}
+
+// write string
+{
+  const validateError = (err) => {
+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, write');
+    assert.strictEqual(err.errno, uv.UV_EBADF);
+    assert.strictEqual(err.code, 'EBADF');
+    assert.strictEqual(err.syscall, 'write');
+    return true;
+  };
+
+  common.runWithInvalidFD((fd) => {
+    fs.write(fd, 'test', 1, common.mustCall(validateError));
+
+    assert.throws(
+      () => fs.writeSync(fd, 'test', 1),
+      validateError
+    );
+  });
+}
+
+
+// futimes
+if (!common.isAIX) {
+  const validateError = (err) => {
+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, futime');
+    assert.strictEqual(err.errno, uv.UV_EBADF);
+    assert.strictEqual(err.code, 'EBADF');
+    assert.strictEqual(err.syscall, 'futime');
+    return true;
+  };
+
+  common.runWithInvalidFD((fd) => {
+    fs.futimes(fd, new Date(), new Date(), common.mustCall(validateError));
+
+    assert.throws(
+      () => fs.futimesSync(fd, new Date(), new Date()),
+      validateError
+    );
+  });
 }

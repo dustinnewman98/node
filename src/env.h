@@ -54,7 +54,26 @@ class performance_state;
 
 namespace loader {
 class ModuleWrap;
-}
+
+struct Exists {
+  enum Bool { Yes, No };
+};
+
+struct IsValid {
+  enum Bool { Yes, No };
+};
+
+struct HasMain {
+  enum Bool { Yes, No };
+};
+
+struct PackageConfig {
+  const Exists::Bool exists;
+  const IsValid::Bool is_valid;
+  const HasMain::Bool has_main;
+  const std::string main;
+};
+}  // namespace loader
 
 // Pick an index that's hopefully out of the way when we're embedded inside
 // another application. Performance-wise or memory-wise it doesn't matter:
@@ -151,6 +170,7 @@ class ModuleWrap;
   V(fd_string, "fd")                                                          \
   V(file_string, "file")                                                      \
   V(fingerprint_string, "fingerprint")                                        \
+  V(fingerprint256_string, "fingerprint256")                                  \
   V(flags_string, "flags")                                                    \
   V(get_data_clone_error_string, "_getDataCloneError")                        \
   V(get_shared_array_buffer_id_string, "_getSharedArrayBufferId")             \
@@ -222,6 +242,7 @@ class ModuleWrap;
   V(priority_string, "priority")                                              \
   V(produce_cached_data_string, "produceCachedData")                          \
   V(promise_string, "promise")                                                \
+  V(pubkey_string, "pubkey")                                                  \
   V(raw_string, "raw")                                                        \
   V(read_host_object_string, "_readHostObject")                               \
   V(readable_string, "readable")                                              \
@@ -306,8 +327,10 @@ class ModuleWrap;
   V(script_context_constructor_template, v8::FunctionTemplate)                \
   V(script_data_constructor_function, v8::Function)                           \
   V(secure_context_constructor_template, v8::FunctionTemplate)                \
+  V(shutdown_wrap_constructor_function, v8::Function)                         \
   V(tcp_constructor_template, v8::FunctionTemplate)                           \
   V(tick_callback_function, v8::Function)                                     \
+  V(timers_callback_function, v8::Function)                                   \
   V(tls_wrap_constructor_function, v8::Function)                              \
   V(tty_constructor_template, v8::FunctionTemplate)                           \
   V(udp_constructor_function, v8::Function)                                   \
@@ -543,6 +566,9 @@ class Environment {
   static inline Environment* GetCurrent(
       const v8::PropertyCallbackInfo<T>& info);
 
+  static uv_key_t thread_local_env;
+  static inline Environment* GetThreadLocalEnv();
+
   inline Environment(IsolateData* isolate_data, v8::Local<v8::Context> context);
   inline ~Environment();
 
@@ -606,6 +632,8 @@ class Environment {
   inline std::vector<double>* destroy_async_id_list();
 
   std::unordered_multimap<int, loader::ModuleWrap*> module_map;
+
+  std::unordered_map<std::string, loader::PackageConfig> package_json_cache;
 
   inline double* heap_statistics_buffer() const;
   inline void set_heap_statistics_buffer(double* pointer);
@@ -735,6 +763,8 @@ class Environment {
 
   static inline Environment* ForAsyncHooks(AsyncHooks* hooks);
 
+  v8::Local<v8::Value> GetNow();
+
  private:
   inline void CreateImmediate(native_immediate_callback cb,
                               void* data,
@@ -779,6 +809,7 @@ class Environment {
   // symbols for Environment, which assumes that the position of members in
   // memory are predictable. For more information please refer to
   // `doc/guides/node-postmortem-support.md`
+  friend int GenDebugSymbols();
   HandleWrapQueue handle_wrap_queue_;
   ReqWrapQueue req_wrap_queue_;
   ListHead<HandleCleanup,
@@ -818,7 +849,7 @@ class Environment {
   struct NativeImmediateCallback {
     native_immediate_callback cb_;
     void* data_;
-    std::unique_ptr<v8::Persistent<v8::Object>> keep_alive_;
+    std::unique_ptr<Persistent<v8::Object>> keep_alive_;
     bool refed_;
   };
   std::vector<NativeImmediateCallback> native_immediate_callbacks_;
@@ -829,8 +860,7 @@ class Environment {
                              v8::Local<v8::Promise> promise,
                              v8::Local<v8::Value> parent);
 
-#define V(PropertyName, TypeName)                                             \
-  v8::Persistent<TypeName> PropertyName ## _;
+#define V(PropertyName, TypeName) Persistent<TypeName> PropertyName ## _;
   ENVIRONMENT_STRONG_PERSISTENT_PROPERTIES(V)
 #undef V
 

@@ -383,11 +383,6 @@ parser.add_option('--with-dtrace',
     dest='with_dtrace',
     help='build with DTrace (default is true on sunos and darwin)')
 
-parser.add_option('--with-lttng',
-    action='store_true',
-    dest='with_lttng',
-    help='build with Lttng (Only supported on Linux)')
-
 parser.add_option('--with-etw',
     action='store_true',
     dest='with_etw',
@@ -438,6 +433,11 @@ intl_optgroup.add_option('--download-path',
     help='Download directory [default: %default]')
 
 parser.add_option_group(intl_optgroup)
+
+parser.add_option('--debug-lib',
+    action='store_true',
+    dest='node_debug_lib',
+    help='build lib with DCHECK macros')
 
 http2_optgroup.add_option('--debug-http2',
     action='store_true',
@@ -908,15 +908,6 @@ def configure_node(o):
   else:
     o['variables']['node_use_dtrace'] = 'false'
 
-  # Enable Lttng if --with-lttng was defined. Use logic similar to
-  # ETW for windows. Lttng is only available on the Linux platform.
-  if flavor == 'linux':
-    o['variables']['node_use_lttng'] = b(options.with_lttng)
-  elif options.with_lttng:
-    raise Exception('lttng is only supported on Linux.')
-  else:
-    o['variables']['node_use_lttng'] = 'false'
-
   if options.no_ifaddrs:
     o['defines'] += ['SUNOS_NO_IFADDRS']
 
@@ -948,6 +939,8 @@ def configure_node(o):
 
   if options.enable_static:
     o['variables']['node_target_type'] = 'static_library'
+
+  o['variables']['node_debug_lib'] = b(options.node_debug_lib)
 
   if options.debug_http2:
     o['variables']['debug_http2'] = 1

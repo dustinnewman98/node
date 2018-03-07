@@ -151,27 +151,30 @@ inline v8::Local<v8::Value> UVException(int errorno,
  * These methods need to be called in a HandleScope.
  *
  * It is preferred that you use the `MakeCallback` overloads taking
- * `async_id` arguments.
+ * `async_context` arguments.
  */
 
-NODE_EXTERN v8::Local<v8::Value> MakeCallback(
-    v8::Isolate* isolate,
-    v8::Local<v8::Object> recv,
-    const char* method,
-    int argc,
-    v8::Local<v8::Value>* argv);
-NODE_EXTERN v8::Local<v8::Value> MakeCallback(
-    v8::Isolate* isolate,
-    v8::Local<v8::Object> recv,
-    v8::Local<v8::String> symbol,
-    int argc,
-    v8::Local<v8::Value>* argv);
-NODE_EXTERN v8::Local<v8::Value> MakeCallback(
-    v8::Isolate* isolate,
-    v8::Local<v8::Object> recv,
-    v8::Local<v8::Function> callback,
-    int argc,
-    v8::Local<v8::Value>* argv);
+NODE_DEPRECATED("Use MakeCallback(..., async_context)",
+                NODE_EXTERN v8::Local<v8::Value> MakeCallback(
+                    v8::Isolate* isolate,
+                    v8::Local<v8::Object> recv,
+                    const char* method,
+                    int argc,
+                    v8::Local<v8::Value>* argv));
+NODE_DEPRECATED("Use MakeCallback(..., async_context)",
+                NODE_EXTERN v8::Local<v8::Value> MakeCallback(
+                    v8::Isolate* isolate,
+                    v8::Local<v8::Object> recv,
+                    v8::Local<v8::String> symbol,
+                    int argc,
+                    v8::Local<v8::Value>* argv));
+NODE_DEPRECATED("Use MakeCallback(..., async_context)",
+                NODE_EXTERN v8::Local<v8::Value> MakeCallback(
+                    v8::Isolate* isolate,
+                    v8::Local<v8::Object> recv,
+                    v8::Local<v8::Function> callback,
+                    int argc,
+                    v8::Local<v8::Value>* argv));
 
 }  // namespace node
 
@@ -184,7 +187,6 @@ NODE_EXTERN v8::Local<v8::Value> MakeCallback(
 #endif
 
 #ifdef _WIN32
-// TODO(tjfontaine) consider changing the usage of ssize_t to ptrdiff_t
 #if !defined(_SSIZE_T_) && !defined(_SSIZE_T_DEFINED)
 typedef intptr_t ssize_t;
 # define _SSIZE_T_
@@ -533,6 +535,9 @@ extern "C" NODE_EXTERN void node_module_register(void* mod);
     }                                                                 \
   }
 
+// Usage: `NODE_MODULE(NODE_GYP_MODULE_NAME, InitializerFunction)`
+// If no NODE_MODULE is declared, Node.js looks for the well-known
+// symbol `node_register_module_v${NODE_MODULE_VERSION}`.
 #define NODE_MODULE(modname, regfunc)                                 \
   NODE_MODULE_X(modname, regfunc, NULL, 0)  // NOLINT (readability/null_usage)
 

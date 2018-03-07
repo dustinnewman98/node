@@ -25,6 +25,7 @@
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
 #include "node.h"
+#include "node_persistent.h"
 #include "util-inl.h"
 #include "env-inl.h"
 #include "uv.h"
@@ -120,10 +121,12 @@ struct sockaddr;
     V(signal_wrap)                                                            \
     V(spawn_sync)                                                             \
     V(stream_wrap)                                                            \
+    V(string_decoder)                                                         \
     V(tcp_wrap)                                                               \
     V(timer_wrap)                                                             \
     V(trace_events)                                                           \
     V(tty_wrap)                                                               \
+    V(types)                                                                  \
     V(udp_wrap)                                                               \
     V(url)                                                                    \
     V(util)                                                                   \
@@ -214,7 +217,7 @@ class Environment;
 template <class TypeName>
 inline v8::Local<TypeName> PersistentToLocal(
     v8::Isolate* isolate,
-    const v8::Persistent<TypeName>& persistent);
+    const Persistent<TypeName>& persistent);
 
 // Creates a new context with Node.js-specific tweaks.  Currently, it removes
 // the `v8BreakIterator` property from the global `Intl` object if present.
